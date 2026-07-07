@@ -21,7 +21,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -45,9 +45,9 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 
 | Command | Purpose |
 |---------|---------|
-| `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only; prints coverage: indexed vs skipped) |
+| `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only; prints coverage: indexed vs skipped; MAP.md ends with a Health section — orphans, broken links, stale semantics) |
 | `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
-| `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections |
+| `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
@@ -63,7 +63,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
 5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5`, read the candidates' relevant sections, and `edge add` only the genuinely related ones. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
-6. **`inferred:` entries in `links` output**: sha-verified connections — use them to discover related documents.
+6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -268,6 +268,11 @@ def stem_map(db):
     return {Path(p).stem.lower(): p for (p,) in db.execute("SELECT path FROM files")}
 
 
+def resolve_stem(stems, dst):
+    # wikilink targets may be path-style ([[insights/foo]]) — match by final stem
+    return stems.get(Path(dst).stem.lower())
+
+
 def note_is_fresh(db, sources_json):
     for s in json.loads(sources_json):
         row = db.execute("SELECT sha FROM files WHERE path=?", (s["path"],)).fetchone()
@@ -373,7 +378,7 @@ def cmd_suggest(root, db, args):
     stems = stem_map(db)
     linked = set()
     for src, dst, kind in db.execute("SELECT src,dst,kind FROM links WHERE kind IN ('wiki','md')"):
-        t = stems.get(dst.lower()) if kind == "wiki" else dst
+        t = resolve_stem(stems, dst) if kind == "wiki" else dst
         if t:
             linked.add(tuple(sorted([src, t])))
     for a, b in db.execute("SELECT src, dst FROM edges"):
@@ -529,10 +534,41 @@ def backlink_counts(db):
     stems = stem_map(db)
     counts = {}
     for src, dst, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
-        target = stems.get(dst.lower()) if kind == "wiki" else dst
+        target = resolve_stem(stems, dst) if kind == "wiki" else dst
         if target and target != src:
             counts[target] = counts.get(target, 0) + 1
     return counts
+
+
+def vault_health(db):
+    stems = stem_map(db)
+    known = {p for (p,) in db.execute("SELECT path FROM files")}
+    connected, broken, broken_seen = set(), [], set()
+    for src, dst, kind in db.execute(
+        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"
+    ):
+        target = resolve_stem(stems, dst) if kind == "wiki" else (dst if dst in known else None)
+        if target and target != src:
+            connected.add(src)
+            connected.add(target)
+        elif not target:
+            label = f"[[{dst}]]" if kind == "wiki" else dst
+            if (label, src) not in broken_seen:
+                broken_seen.add((label, src))
+                broken.append((label, src))
+    edges = fresh_edges(db)
+    for src, dst, _, _, _ in edges["fresh"]:
+        connected.add(src)
+        connected.add(dst)
+    stale_notes = sum(
+        1 for (s,) in db.execute("SELECT sources FROM notes") if not note_is_fresh(db, s)
+    )
+    return {
+        "orphans": sorted(known - connected),
+        "broken": broken,
+        "stale_notes": stale_notes,
+        "stale_edges": len(edges["stale"]),
+    }
 
 
 def write_map(root, db):
@@ -601,6 +637,26 @@ def write_map(root, db):
         fresh = [q for q, s in notes if note_is_fresh(db, s)]
         out += ["", "## Semantic notes " + f"({len(fresh)} fresh / {len(notes) - len(fresh)} stale)", ""]
         out += [f"- {q}" for q in fresh[:10]]
+
+    h = vault_health(db)
+    out += ["", "## Health", ""]
+    if h["orphans"]:
+        sample = " · ".join(f"`{p}`" for p in h["orphans"][:5])
+        more = f" · … +{len(h['orphans']) - 5}" if len(h["orphans"]) > 5 else ""
+        out.append(f"- orphan docs (no links in or out): {len(h['orphans'])} — {sample}{more}")
+    else:
+        out.append("- orphan docs: 0")
+    if h["broken"]:
+        sample = " · ".join(f"`{lbl}` in {src}" for lbl, src in h["broken"][:5])
+        more = f" · … +{len(h['broken']) - 5}" if len(h["broken"]) > 5 else ""
+        out.append(f"- broken links (target missing): {len(h['broken'])} — {sample}{more}")
+    else:
+        out.append("- broken links: 0")
+    out.append(
+        f"- stale semantics: {h['stale_notes']} notes, {h['stale_edges']} edges"
+        + (" — `wikimap notes --prune` / `wikimap edges --prune`"
+           if h["stale_notes"] or h["stale_edges"] else "")
+    )
 
     (root / "MAP.md").write_text("\n".join(out) + "\n", encoding="utf-8")
 
@@ -729,14 +785,16 @@ def cmd_links(root, db, args):
     print(f"== {path}")
     print("outlinks:")
     for dst, kind in db.execute("SELECT dst, kind FROM links WHERE src=? ORDER BY kind", (path,)):
-        resolved = stems.get(dst.lower(), dst) if kind == "wiki" else dst
-        print(f"  [{kind}] {resolved}")
+        resolved = (resolve_stem(stems, dst) or dst) if kind == "wiki" else dst
+        tag = f"linked|{kind}" if kind in ("wiki", "md") else kind
+        print(f"  [{tag}] {resolved}")
     print("backlinks:")
-    my_stem = Path(path).stem.lower()
+    seen_back = set()
     for src, dst, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
-        resolved = stems.get(dst.lower()) if kind == "wiki" else dst
-        if resolved == path or (kind == "wiki" and dst.lower() == my_stem):
-            print(f"  [{kind}] {src}")
+        resolved = resolve_stem(stems, dst) if kind == "wiki" else dst
+        if resolved == path and src not in seen_back:
+            seen_back.add(src)
+            print(f"  [linked|{kind}] {src}")
     inferred = [
         e for e in fresh_edges(db)["fresh"] if path in (e[0], e[1])
     ]
@@ -744,7 +802,7 @@ def cmd_links(root, db, args):
         print("inferred:")
         for src, dst, rel, rat, origin in inferred:
             other = dst if src == path else src
-            print(f"  [{rel}|{origin}] {other}")
+            print(f"  [inferred|{rel}|{origin}] {other}")
             print(f"    ∵ {rat[:120]}")
 
 
@@ -772,7 +830,7 @@ def cmd_path(root, db, args):
         adj.setdefault(a, {}).setdefault(b, label)
 
     for s, d, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
-        t = stems.get(d.lower()) if kind == "wiki" else d
+        t = resolve_stem(stems, d) if kind == "wiki" else d
         if t and t != s and t in known:
             add(s, t, f"—[{kind}]→")
             add(t, s, f"←[{kind}]—")

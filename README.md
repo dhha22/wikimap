@@ -1,5 +1,7 @@
 # wikimap
 
+[![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml)
+
 **Zero-LLM incremental index + lazy semantic layer for markdown knowledge bases.**
 
 One Python file. Zero dependencies. Zero LLM cost at build time — always. Sub-second updates, no matter how stale your index is.
@@ -17,7 +19,7 @@ wikimap inverts the design: **eager structure, lazy semantics.**
 
 The LLM cost is proportional to **what you actually asked**, never to corpus size.
 
-## Measured (262-doc Korean/English vault, M-series Mac, wikimap 0.3.0)
+## Measured (262-doc Korean/English vault, M-series Mac, wikimap 0.4.0)
 
 | Operation | wikimap | graphify (same vault, same change set) |
 |---|---|---|
@@ -31,7 +33,9 @@ The LLM cost is proportional to **what you actually asked**, never to corpus siz
 
 At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time — an FTS5 trigram index kicks in at ≥500 docs), incremental update with 3 changes **0.19 s**, search 60–100 ms via FTS5 (vs ~0.3 s linear fallback). Queries containing terms under 3 characters fall back to the exact linear scan, so CJK short-word recall is never sacrificed for speed.
 
-Reproduce on your own vault: `python3 bench.py --root <vault> --cold` (script in this repo).
+On an expanded 30-query golden set (Korean/English/mixed, 309-doc vault): **recall@5 30/30, avg 67 ms**. Ranking changes are gated by this kind of golden set in CI — the test suite (`python3 tests.py`, stdlib only) covers incremental sync, ghost-free deletes, byte-identical determinism, FTS consistency at scale, CJK short-term fallback, and install never touching an existing `SKILL.md`. CI runs it on macOS, Linux, and Windows, Python 3.8 and 3.13.
+
+Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
 
 ## Install
 
@@ -47,9 +51,9 @@ That's the whole thing. `install --project` writes to `./.claude` for per-repo s
 
 | Command | What it does |
 |---|---|
-| `update` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first. Prints coverage — indexed vs skipped counts by extension, so nothing is dropped silently |
+| `update` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first. Prints coverage — indexed vs skipped counts by extension, so nothing is dropped silently. `MAP.md` ends with a Health section: orphan docs, broken links, stale semantics |
 | `search "query" [-n 8] [-C 3 \| --full]` | Ranked section search — filename, title, and heading matches boosted; FTS5-accelerated on vaults ≥500 docs. Exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first |
-| `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID |
+| `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID. Trust tags on every entry: `[linked\|…]` = a human wrote it in the source, `[inferred\|…]` = guessed then confirmed, sha-verified |
 | `path <a> <b>` | Shortest connection path between two docs — BFS over wiki/markdown links (both directions) plus fresh inferred edges |
 | `note add` | Save an answer-time insight, pinned to source content hashes |
 | `suggest [--doc path]` | Heuristic candidates for unwritten connections: shared rare terms, shared requirement IDs, shared code references. 0.2 s, no LLM |

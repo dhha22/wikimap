@@ -23,7 +23,7 @@ def run(root, *cmd):
     t0 = time.time()
     r = subprocess.run(
         [sys.executable, WIKIMAP, "--root", str(root), *cmd],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     return time.time() - t0, r.stdout
 

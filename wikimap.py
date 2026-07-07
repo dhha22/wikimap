@@ -17,20 +17,23 @@ import re
 import sqlite3
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
     ".claude", ".github", "__pycache__", ".venv", "venv",
 }
 IGNORE_FILES = {"MAP.md"}
+PLAIN_EXTS = {".txt", ".rst", ".org", ".adoc"}
+INDEX_EXTS = {".md"} | PLAIN_EXTS
 
 SKILL_TEMPLATE = """---
 name: wikimap
-description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
+description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain-text .txt/.rst/.org/.adoc indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
 ---
 
 # wikimap
@@ -43,8 +46,9 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | Command | Purpose |
 |---------|---------|
 | `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only) |
-| `search "query" [-n 8]` | ranked section search; fresh notes surface first; CJK substring-safe |
+| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search; shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections |
+| `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
 | `suggest [--doc path] [-n 10]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM) |
@@ -54,7 +58,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 
 ## Rules for the agent
 
-1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files.
+1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files. For fact/value questions ("what is the limit/period/owner?"), retry with `-C 3` or `--full` before falling back to Read.
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
@@ -124,28 +128,48 @@ def parse_frontmatter(lines):
     return meta, end
 
 
+def parse_plain_sections(rel, lines):
+    sections = []
+    buf, start = [], 1
+    for i, ln in enumerate(lines):
+        if not ln.strip() and sum(1 for l in buf if l.strip()) >= 12:
+            heading = next((l.strip()[:60] for l in buf if l.strip()), "(text)")
+            sections.append((rel, start, 1, heading, "\n".join(buf).strip("\n")))
+            buf, start = [], i + 2
+        else:
+            buf.append(ln)
+    if any(l.strip() for l in buf):
+        heading = next((l.strip()[:60] for l in buf if l.strip()), "(text)")
+        sections.append((rel, start, 1, heading, "\n".join(buf).strip("\n")))
+    return sections
+
+
 def parse_file(root: Path, path: Path):
     rel = str(path.relative_to(root))
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    meta, body_start = parse_frontmatter(lines)
 
-    title = meta.get("title") or ""
-    sections = []
-    cur_heading, cur_level, cur_line, buf = "(intro)", 0, body_start + 1, []
-    for i in range(body_start, len(lines)):
-        m = HEADING.match(lines[i])
-        if m:
-            if buf or cur_heading != "(intro)":
-                sections.append((rel, cur_line, cur_level, cur_heading, "\n".join(buf)))
-            cur_level, cur_heading, cur_line, buf = len(m.group(1)), m.group(2).strip(), i + 1, []
-            if not title and cur_level == 1:
-                title = cur_heading
-        else:
-            buf.append(lines[i])
-    sections.append((rel, cur_line, cur_level, cur_heading, "\n".join(buf)))
-    if not title:
-        title = path.stem
+    if path.suffix.lower() == ".md":
+        meta, body_start = parse_frontmatter(lines)
+        title = meta.get("title") or ""
+        sections = []
+        cur_heading, cur_level, cur_line, buf = "(intro)", 0, body_start + 1, []
+        for i in range(body_start, len(lines)):
+            m = HEADING.match(lines[i])
+            if m:
+                if buf or cur_heading != "(intro)":
+                    sections.append((rel, cur_line, cur_level, cur_heading, "\n".join(buf)))
+                cur_level, cur_heading, cur_line, buf = len(m.group(1)), m.group(2).strip(), i + 1, []
+                if not title and cur_level == 1:
+                    title = cur_heading
+            else:
+                buf.append(lines[i])
+        sections.append((rel, cur_line, cur_level, cur_heading, "\n".join(buf)))
+        if not title:
+            title = path.stem
+    else:
+        sections = parse_plain_sections(rel, lines)
+        title = next((l.strip()[:80] for l in lines if l.strip()), path.stem)
 
     links = []
     for m in WIKILINK.finditer(text):
@@ -175,8 +199,10 @@ def parse_file(root: Path, path: Path):
     }
 
 
-def scan_md_files(root: Path):
-    for p in sorted(root.rglob("*.md")):
+def scan_files(root: Path):
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in INDEX_EXTS or not p.is_file():
+            continue
         if p.name in IGNORE_FILES:
             continue
         if any(part in IGNORE_DIRS for part in p.relative_to(root).parts):
@@ -390,7 +416,7 @@ def cmd_update(root, db, args):
     t0 = time.time()
     seen, changed = set(), 0
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
-    for p in scan_md_files(root):
+    for p in scan_files(root):
         rel = str(p.relative_to(root))
         seen.add(rel)
         prev = known.get(rel)
@@ -539,14 +565,26 @@ def cmd_search(root, db, args):
         print("no results")
         return
     for score, path, line, heading, content in results[: args.n]:
-        snippet = ""
-        for ln in content.splitlines():
-            if any(t in ln.lower() for t in terms):
-                snippet = ln.strip()[:120]
-                break
         print(f"{path}:{line}  [{heading}]  (score {score})")
-        if snippet:
-            print(f"  {snippet}")
+        lines = content.splitlines()
+        if args.full:
+            for ln in lines:
+                print(f"  {ln.rstrip()}")
+            continue
+        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in terms)]
+        if args.context:
+            shown = set()
+            for i in hits:
+                shown.update(range(max(0, i - args.context), min(len(lines), i + args.context + 1)))
+            prev = None
+            for j in sorted(shown):
+                if prev is not None and j > prev + 1:
+                    print("  ⋯")
+                print(f"  {lines[j].rstrip()[:200]}")
+                prev = j
+        else:
+            for i in hits[:3]:
+                print(f"  {lines[i].strip()[:160]}")
 
 
 def cmd_links(root, db, args):
@@ -585,6 +623,63 @@ def cmd_links(root, db, args):
             other = dst if src == path else src
             print(f"  [{rel}|{origin}] {other}")
             print(f"    ∵ {rat[:120]}")
+
+
+def cmd_path(root, db, args):
+    stems = stem_map(db)
+    known = {p for (p,) in db.execute("SELECT path FROM files")}
+
+    def resolve(t):
+        if t in known:
+            return t
+        return stems.get(Path(t).stem.lower())
+
+    src, dst = resolve(args.src), resolve(args.dst)
+    if not src:
+        sys.exit(f"not found: {args.src}")
+    if not dst:
+        sys.exit(f"not found: {args.dst}")
+    if src == dst:
+        print(src)
+        return
+
+    adj = {}
+
+    def add(a, b, label):
+        adj.setdefault(a, {}).setdefault(b, label)
+
+    for s, d, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
+        t = stems.get(d.lower()) if kind == "wiki" else d
+        if t and t != s and t in known:
+            add(s, t, f"—[{kind}]→")
+            add(t, s, f"←[{kind}]—")
+    for s, d, rel, _, origin in fresh_edges(db)["fresh"]:
+        add(s, d, f"↔[{rel}|{origin}]")
+        add(d, s, f"↔[{rel}|{origin}]")
+
+    prev = {src: None}
+    q = deque([src])
+    while q:
+        cur = q.popleft()
+        if cur == dst:
+            break
+        for nxt in adj.get(cur, {}):
+            if nxt not in prev:
+                prev[nxt] = cur
+                q.append(nxt)
+    if dst not in prev:
+        print(f"no path: {src} ↮ {dst}")
+        return
+    chain = []
+    cur = dst
+    while cur is not None:
+        chain.append(cur)
+        cur = prev[cur]
+    chain.reverse()
+    print(chain[0])
+    for a, b in zip(chain, chain[1:]):
+        print(f"  {adj[a][b]} {b}")
+    print(f"({len(chain) - 1} hops)")
 
 
 def cmd_note_add(root, db, args):
@@ -656,9 +751,16 @@ def main():
     sp = sub.add_parser("search", help="ranked section search")
     sp.add_argument("query")
     sp.add_argument("-n", type=int, default=8)
+    sp.add_argument("-C", type=int, default=0, dest="context",
+                    help="show N context lines around each matched line")
+    sp.add_argument("--full", action="store_true", help="print the whole matched section")
 
     lp = sub.add_parser("links", help="outlinks/backlinks of a doc, or docs for a REQ-ID")
     lp.add_argument("target")
+
+    pp = sub.add_parser("path", help="shortest link path between two docs (BFS over links + fresh edges)")
+    pp.add_argument("src")
+    pp.add_argument("dst")
 
     np_ = sub.add_parser("note", help="save an answer-time semantic insight")
     np_.add_argument("add", choices=["add"])
@@ -705,6 +807,8 @@ def main():
             cmd_search(root, db, args)
         elif args.cmd == "links":
             cmd_links(root, db, args)
+        elif args.cmd == "path":
+            cmd_path(root, db, args)
         elif args.cmd == "note":
             cmd_note_add(root, db, args)
         elif args.cmd == "notes":

@@ -43,8 +43,9 @@ That's the whole thing. `install --project` writes to `./.claude` for per-repo s
 | Command | What it does |
 |---|---|
 | `update` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first |
-| `search "query" [-n 8]` | Ranked section search — exact file:line + snippet. Fresh notes surface first |
+| `search "query" [-n 8] [-C 3 \| --full]` | Ranked section search — exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first |
 | `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID |
+| `path <a> <b>` | Shortest connection path between two docs — BFS over wiki/markdown links (both directions) plus fresh inferred edges |
 | `note add` | Save an answer-time insight, pinned to source content hashes |
 | `suggest [--doc path]` | Heuristic candidates for unwritten connections: shared rare terms, shared requirement IDs, shared code references. 0.2 s, no LLM |
 | `edge add` | Confirm a connection (agent judges `suggest` candidates); pinned to both files' hashes |
@@ -64,7 +65,7 @@ That's the whole thing. `install --project` writes to `./.claude` for per-repo s
 
 ## Scope
 
-wikimap indexes **markdown knowledge bases**. It does not parse code ASTs — if you need a call graph of a codebase, use a code-aware tool. It shines where your corpus is prose with structure: specs, policies, plans, notes, research.
+wikimap indexes **markdown knowledge bases**, plus plain-text prose (`.txt`, `.rst`, `.org`, `.adoc` — sectioned by paragraph blocks). It does not parse code ASTs — if you need a call graph of a codebase, use a code-aware tool. It shines where your corpus is prose with structure: specs, policies, plans, notes, research.
 
 ## License
 

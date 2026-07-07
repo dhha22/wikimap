@@ -31,7 +31,7 @@ The LLM cost is proportional to **what you actually asked**, never to corpus siz
 ## Install
 
 ```bash
-curl -O https://raw.githubusercontent.com/hadonghyun/wikimap/main/wikimap.py
+curl -O https://raw.githubusercontent.com/dhha22/wikimap/main/wikimap.py
 python3 wikimap.py install          # → ~/.claude/skills/wikimap/ (Claude Code)
 cd your-vault && python3 ~/.claude/skills/wikimap/wikimap.py update
 ```

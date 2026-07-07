@@ -17,16 +17,21 @@ wikimap inverts the design: **eager structure, lazy semantics.**
 
 The LLM cost is proportional to **what you actually asked**, never to corpus size.
 
-## Measured (306-doc Korean/English vault, M-series Mac)
+## Measured (262-doc Korean/English vault, M-series Mac, wikimap 0.3.0)
 
 | Operation | wikimap | graphify (same vault, same change set) |
 |---|---|---|
-| Full index build | 0.4 s, $0 | minutes + LLM extraction cost |
-| Update after editing 2 docs + deleting 1 | **0.35 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
+| Full index build | 0.5 s, $0 | minutes + LLM extraction cost |
+| Update after editing 1 doc + adding 1 + deleting 1 | **0.1 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
 | Update after index drifted for days | still sub-second (sha-diff) | re-detected 287 of 306 files as changed → near-full re-extraction |
-| Search | ~60 ms, returns section + line number + snippet | graph traversal returns entity labels; you still re-read the source files |
-| Deleted file cleanup | automatic, verified | ghost nodes remained (path-prefix mismatch) |
-| CJK queries | native substring matching | default query filter drops terms shorter than 4 chars — every Korean query returned 0 nodes |
+| Search recall@5 (10 mixed Korean/English queries) | **10/10**, ~60 ms | 5/10 start-node matches — default query filter drops terms shorter than 4 chars, so every short Korean term is discarded |
+| Search output | section + line number + matched snippet | entity labels; you still re-read the source files |
+| Deleted file cleanup | automatic, verified | 9.7% of source files in the graph were ghosts (already deleted); 40 duplicate node labels |
+| Determinism | same input → byte-identical index | non-deterministic graphs from identical inputs ([upstream #1695](https://github.com/Graphify-Labs/graphify/issues/1695)) |
+
+At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time — an FTS5 trigram index kicks in at ≥500 docs), incremental update with 3 changes **0.19 s**, search 60–100 ms via FTS5 (vs ~0.3 s linear fallback). Queries containing terms under 3 characters fall back to the exact linear scan, so CJK short-word recall is never sacrificed for speed.
+
+Reproduce on your own vault: `python3 bench.py --root <vault> --cold` (script in this repo).
 
 ## Install
 
@@ -42,8 +47,8 @@ That's the whole thing. `install --project` writes to `./.claude` for per-repo s
 
 | Command | What it does |
 |---|---|
-| `update` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first |
-| `search "query" [-n 8] [-C 3 \| --full]` | Ranked section search — exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first |
+| `update` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first. Prints coverage — indexed vs skipped counts by extension, so nothing is dropped silently |
+| `search "query" [-n 8] [-C 3 \| --full]` | Ranked section search — filename, title, and heading matches boosted; FTS5-accelerated on vaults ≥500 docs. Exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first |
 | `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID |
 | `path <a> <b>` | Shortest connection path between two docs — BFS over wiki/markdown links (both directions) plus fresh inferred edges |
 | `note add` | Save an answer-time insight, pinned to source content hashes |

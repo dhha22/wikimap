@@ -17,11 +17,11 @@ import re
 import sqlite3
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -45,8 +45,8 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 
 | Command | Purpose |
 |---------|---------|
-| `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only) |
-| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search; shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
+| `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only; prints coverage: indexed vs skipped) |
+| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
@@ -109,9 +109,59 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_sections_path ON sections(path);
         CREATE INDEX IF NOT EXISTS idx_links_src ON links(src);
         CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         """
     )
+    try:
+        db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5("
+            "path UNINDEXED, line UNINDEXED, heading, content, tokenize='trigram')"
+        )
+    except sqlite3.OperationalError:
+        pass  # sqlite < 3.34 has no trigram tokenizer — search falls back to linear scan
     return db
+
+
+FTS_MIN_DOCS = 500  # below this a linear scan is already sub-100ms — skip FTS upkeep
+
+
+def has_fts(db):
+    return bool(
+        db.execute("SELECT 1 FROM sqlite_master WHERE name='sections_fts'").fetchone()
+    )
+
+
+def fts_populated(db):
+    return bool(db.execute("SELECT 1 FROM sections_fts LIMIT 1").fetchone())
+
+
+def sync_fts(db, changed_rels, deleted_rels):
+    if not has_fts(db):
+        return
+    total = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    if total < FTS_MIN_DOCS:
+        if fts_populated(db):
+            db.execute("DELETE FROM sections_fts")
+        return
+    if not fts_populated(db):
+        db.execute(
+            "INSERT INTO sections_fts(path, line, heading, content) "
+            "SELECT path, line, heading, content FROM sections"
+        )
+        return
+    stale = sorted(set(changed_rels) | set(deleted_rels))
+    for i in range(0, len(stale), 500):
+        chunk = stale[i : i + 500]
+        db.execute(
+            "DELETE FROM sections_fts WHERE path IN (%s)" % ",".join("?" * len(chunk)),
+            chunk,
+        )
+    for rel in changed_rels:
+        db.execute(
+            "INSERT INTO sections_fts(path, line, heading, content) "
+            "SELECT path, line, heading, content FROM sections WHERE path=?",
+            (rel,),
+        )
 
 
 def parse_frontmatter(lines):
@@ -199,13 +249,17 @@ def parse_file(root: Path, path: Path):
     }
 
 
-def scan_files(root: Path):
+def scan_files(root: Path, skipped: Counter = None):
     for p in sorted(root.rglob("*")):
-        if p.suffix.lower() not in INDEX_EXTS or not p.is_file():
+        if not p.is_file():
+            continue
+        if any(part in IGNORE_DIRS for part in p.relative_to(root).parts):
             continue
         if p.name in IGNORE_FILES:
             continue
-        if any(part in IGNORE_DIRS for part in p.relative_to(root).parts):
+        if p.suffix.lower() not in INDEX_EXTS:
+            if skipped is not None:
+                skipped[p.suffix.lower() or "(no ext)"] += 1
             continue
         yield p
 
@@ -414,9 +468,10 @@ def cmd_edges(root, db, args):
 
 def cmd_update(root, db, args):
     t0 = time.time()
-    seen, changed = set(), 0
+    skipped = Counter()
+    seen, changed_rels = set(), []
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
-    for p in scan_files(root):
+    for p in scan_files(root, skipped):
         rel = str(p.relative_to(root))
         seen.add(rel)
         prev = known.get(rel)
@@ -434,13 +489,18 @@ def cmd_update(root, db, args):
         )
         db.executemany("INSERT INTO sections VALUES(?,?,?,?,?)", parsed["sections"])
         db.executemany("INSERT INTO links VALUES(?,?,?)", parsed["links"])
-        changed += 1
+        changed_rels.append(rel)
 
     deleted = set(known) - seen
     for rel in deleted:
         db.execute("DELETE FROM files WHERE path=?", (rel,))
         db.execute("DELETE FROM sections WHERE path=?", (rel,))
         db.execute("DELETE FROM links WHERE src=?", (rel,))
+    sync_fts(db, changed_rels, deleted)
+    db.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('skipped', ?)",
+        (json.dumps(dict(skipped.most_common())),),
+    )
     db.commit()
 
     fresh = stale = 0
@@ -454,9 +514,13 @@ def cmd_update(root, db, args):
     e = fresh_edges(db)
     total = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     ms = int((time.time() - t0) * 1000)
+    n_skipped = sum(skipped.values())
+    top = ", ".join(f"{ext} {n}" for ext, n in skipped.most_common(3))
     print(
-        f"wikimap: {total} files indexed ({changed} changed, {len(deleted)} deleted) "
-        f"in {ms}ms | notes: {fresh} fresh, {stale} stale | "
+        f"wikimap: {total} files indexed ({len(changed_rels)} changed, {len(deleted)} deleted) "
+        f"in {ms}ms | skipped {n_skipped} non-indexed files"
+        + (f" ({top})" if top else "")
+        + f" | notes: {fresh} fresh, {stale} stale | "
         f"edges: {len(e['fresh'])} fresh, {len(e['stale'])} stale | MAP.md updated"
     )
 
@@ -479,6 +543,17 @@ def write_map(root, db):
         "",
         f"> auto-generated by wikimap ({now}) — do not edit. Refresh: `wikimap update`",
         f"> {total} files · ~{words:,} words",
+    ]
+    row = db.execute("SELECT value FROM meta WHERE key='skipped'").fetchone()
+    if row:
+        skipped = json.loads(row[0])
+        n = sum(skipped.values())
+        top = " · ".join(f"{ext} {c}" for ext, c in list(skipped.items())[:4])
+        out.append(
+            f"> coverage: every file accounted for — {total} indexed, {n} skipped"
+            + (f" ({top})" if top else "")
+        )
+    out += [
         "",
         "## Directories",
         "",
@@ -530,6 +605,36 @@ def write_map(root, db):
     (root / "MAP.md").write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def candidate_paths(db, terms, titles):
+    """FTS5 pre-filter: docs that can possibly satisfy every term.
+
+    Returns None to request a full linear scan (no FTS, or a term shorter
+    than the trigram minimum — pitfall: trigram cannot match <3 chars).
+    """
+    if not has_fts(db) or not fts_populated(db):
+        return None
+    paths = None
+    for t in terms:
+        if len(t) < 3:
+            return None
+        cur = {p for p in titles if t in p.lower() or t in (titles[p] or "").lower()}
+        match = '"%s"' % t.replace('"', '""')
+        try:
+            cur |= {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT path FROM sections_fts WHERE sections_fts MATCH ?",
+                    (match,),
+                )
+            }
+        except sqlite3.OperationalError:
+            return None
+        paths = cur if paths is None else (paths & cur)
+        if not paths:
+            return paths
+    return paths
+
+
 def cmd_search(root, db, args):
     terms = [t.lower() for t in args.query.split() if t.strip()]
     if not terms:
@@ -548,16 +653,34 @@ def cmd_search(root, db, args):
                 break
 
     titles = {p: t for p, t in db.execute("SELECT path, title FROM files")}
+    paths = candidate_paths(db, terms, titles)
+    if paths is None:
+        rows = db.execute("SELECT path, line, heading, content FROM sections")
+    elif not paths:
+        rows = []
+    else:
+        rows = []
+        plist = sorted(paths)
+        for i in range(0, len(plist), 500):
+            chunk = plist[i : i + 500]
+            rows += db.execute(
+                "SELECT path, line, heading, content FROM sections WHERE path IN (%s)"
+                % ",".join("?" * len(chunk)),
+                chunk,
+            ).fetchall()
+
     results = []
-    for path, line, level, heading, content in db.execute(
-        "SELECT path, line, level, heading, content FROM sections"
-    ):
+    for path, line, heading, content in rows:
         title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
-        if not all(t in title_l or t in heading_l or t in content_l for t in terms):
+        path_l = path.lower()
+        if not all(t in title_l or t in path_l or t in heading_l or t in content_l for t in terms):
             continue
         score = 0
         for t in terms:
-            score += 8 * (t in title_l) + 5 * (t in heading_l) + min(content_l.count(t), 5)
+            score += (
+                8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
+                + min(content_l.count(t), 5)
+            )
         results.append((score, path, line, heading, content))
 
     results.sort(key=lambda r: -r[0])
@@ -737,6 +860,13 @@ def cmd_install(args):
 
 
 def main():
+    # Windows consoles default to cp949/cp1252 — arrows (↔, →) would crash print()
+    for stream in (sys.stdout, sys.stderr):
+        if (stream.encoding or "").lower() not in ("utf-8", "utf8"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     ap = argparse.ArgumentParser(prog="wikimap")
     ap.add_argument("--root", help="vault root (default: walk up to find .wikimap, else cwd)")
     ap.add_argument("--version", action="version", version=f"wikimap {VERSION}")

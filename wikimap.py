@@ -31,7 +31,7 @@ IGNORE_FILES = {"MAP.md"}
 PLAIN_EXTS = {".txt", ".rst", ".org", ".adoc"}
 INDEX_EXTS = {".md"} | PLAIN_EXTS
 
-SKILL_TEMPLATE = """---
+SKILL_TEMPLATE = r"""---
 name: wikimap
 description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain-text .txt/.rst/.org/.adoc indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
 ---
@@ -75,6 +75,11 @@ REQID = re.compile(r"\bREQ-\d+\b")
 
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def norm_rel(p):
+    # index keys are POSIX-style — Windows args/paths would miss otherwise
+    return str(p).replace("\\", "/")
 
 
 def find_root(cli_root):
@@ -195,7 +200,7 @@ def parse_plain_sections(rel, lines):
 
 
 def parse_file(root: Path, path: Path):
-    rel = str(path.relative_to(root))
+    rel = path.relative_to(root).as_posix()
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
@@ -229,9 +234,9 @@ def parse_file(root: Path, path: Path):
         if not dst.startswith("http"):
             resolved = (path.parent / dst).resolve()
             try:
-                dst = str(resolved.relative_to(root))
+                dst = resolved.relative_to(root).as_posix()
             except ValueError:
-                pass
+                dst = norm_rel(dst)
             links.append((rel, dst, "md"))
     for m in set(CODEREF.findall(text)):
         links.append((rel, m, "code"))
@@ -386,11 +391,13 @@ def cmd_suggest(root, db, args):
 
     scores, why = {}, {}
 
+    doc_filter = norm_rel(args.doc) if args.doc else None
+
     def bump(pa, pb, amount, signal):
         key = tuple(sorted([pa, pb]))
         if key in linked:
             return
-        if args.doc and args.doc not in key:
+        if doc_filter and doc_filter not in key:
             return
         scores[key] = scores.get(key, 0) + amount
         w = why.setdefault(key, [])
@@ -437,12 +444,13 @@ def cmd_suggest(root, db, args):
 
 def cmd_edge_add(root, db, args):
     shas = {}
-    for p in (args.src, args.dst):
+    src, dst = norm_rel(args.src), norm_rel(args.dst)
+    for p in (src, dst):
         row = db.execute("SELECT sha FROM files WHERE path=?", (p,)).fetchone()
         if not row:
             sys.exit(f"not in index (run update first?): {p}")
         shas[p] = row[0]
-    a, b = sorted([args.src, args.dst])
+    a, b = sorted([src, dst])
     db.execute(
         "INSERT OR REPLACE INTO edges(src,dst,relation,rationale,origin,created,src_sha,dst_sha)"
         " VALUES(?,?,?,?,?,?,?,?)",
@@ -477,7 +485,7 @@ def cmd_update(root, db, args):
     seen, changed_rels = set(), []
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
     for p in scan_files(root, skipped):
-        rel = str(p.relative_to(root))
+        rel = p.relative_to(root).as_posix()
         seen.add(rel)
         prev = known.get(rel)
         if prev and abs(prev[1] - p.stat().st_mtime) < 1e-6:
@@ -767,7 +775,7 @@ def cmd_search(root, db, args):
 
 
 def cmd_links(root, db, args):
-    target = args.target
+    target = norm_rel(args.target)
     if REQID.fullmatch(target):
         rows = db.execute("SELECT src FROM links WHERE kind='req' AND dst=?", (target,)).fetchall()
         print(f"{target} appears in {len(rows)} docs:")
@@ -811,6 +819,7 @@ def cmd_path(root, db, args):
     known = {p for (p,) in db.execute("SELECT path FROM files")}
 
     def resolve(t):
+        t = norm_rel(t)
         if t in known:
             return t
         return stems.get(Path(t).stem.lower())
@@ -866,7 +875,7 @@ def cmd_path(root, db, args):
 def cmd_note_add(root, db, args):
     sources = []
     for p in args.sources.split(","):
-        p = p.strip()
+        p = norm_rel(p.strip())
         row = db.execute("SELECT sha FROM files WHERE path=?", (p,)).fetchone()
         if not row:
             sys.exit(f"source not in index (run update first?): {p}")

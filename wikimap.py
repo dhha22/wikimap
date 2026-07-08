@@ -11,6 +11,7 @@ Design: eager structure, lazy semantics.
 Single file, stdlib only.
 """
 import argparse
+import base64
 import difflib
 import fnmatch
 import hashlib
@@ -320,7 +321,7 @@ def parse_frontmatter_tags(raw):
     return [t.strip().strip("\"'").lower() for t in raw.strip("[]").split(",") if t.strip()]
 
 
-def _pdf_str(raw: bytes) -> str:
+def _pdf_unescape(raw: bytes) -> bytes:
     out, i = bytearray(), 0
     esc = {ord("n"): 10, ord("r"): 13, ord("t"): 9,
            ord("("): 40, ord(")"): 41, ord("\\"): 92}
@@ -343,7 +344,11 @@ def _pdf_str(raw: bytes) -> str:
         else:
             out.append(c)
             i += 1
-    b = bytes(out)
+    return bytes(out)
+
+
+def _pdf_str(raw: bytes) -> str:
+    b = _pdf_unescape(raw)
     if b[:2] == b"\xfe\xff":
         return b[2:].decode("utf-16-be", errors="replace")
     return b.decode("latin-1", errors="replace")
@@ -357,51 +362,365 @@ def _pdf_wordish(s: str) -> bool:
     return good / len(s) >= 0.8
 
 
-def extract_pdf_text(data: bytes):
-    """Deterministic literal-string extraction, BT..ET text blocks only — image/CID
-    streams yield nothing wordish, so scanned or CJK-CID PDFs fall back to name-only."""
-    parts = []
+PDF_OBJ = re.compile(rb"(\d+)\s+\d+\s+obj\b(.*?)endobj", re.DOTALL)
+PDF_HEXSTR = re.compile(rb"<([0-9A-Fa-f]+)>")
 
-    def emit(raw):
-        s = _pdf_str(raw)
-        if _pdf_wordish(s):
-            parts.append(s)
 
-    def harvest(buf):
-        if b"BT" not in buf:
-            return
-        for block in PDF_TEXTBLOCK.finditer(buf):
-            b = block.group(1)
-            for m in PDF_SHOWTEXT.finditer(b):
-                emit(m.group(1))
-                parts.append(" ")
-            for arr in PDF_ARRAY.finditer(b):
-                body = arr.group(1)
-                if b"(" not in body:
-                    continue
-                for lit in PDF_LITERAL.finditer(body):
-                    emit(lit.group(1))
-                parts.append(" ")
-            parts.append("\n")
+def _hexbytes(h: bytes) -> bytes:
+    h = bytes(h).translate(None, b" \t\r\n\v\f")
+    if len(h) % 2:
+        h += b"0"
+    return bytes.fromhex(h.decode("ascii"))
 
-    for m in PDF_STREAM.finditer(data):
-        buf = m.group(1)
+
+def _balanced(buf, i, open_b, close_b):
+    depth, j, L = 0, i, len(buf)
+    lo, lc = len(open_b), len(close_b)
+    while j < L:
+        if buf[j : j + lo] == open_b:
+            depth += 1
+            j += lo
+        elif buf[j : j + lc] == close_b:
+            depth -= 1
+            j += lc
+            if depth == 0:
+                return buf[i + lo : j - lc], j
+        else:
+            j += 1
+    return buf[i + lo :], L
+
+
+def _pdf_value(buf, key):
+    """Raw value after /Key in a dict body: ('ref', n) | ('dict' | 'array' | 'name', bytes) | None."""
+    m = re.search(rb"/" + re.escape(key) + rb"(?![A-Za-z0-9.#_-])\s*", buf)
+    if not m:
+        return None
+    j = m.end()
+    if buf[j : j + 2] == b"<<":
+        return "dict", _balanced(buf, j, b"<<", b">>")[0]
+    if buf[j : j + 1] == b"[":
+        return "array", _balanced(buf, j, b"[", b"]")[0]
+    mr = re.match(rb"(\d+)\s+\d+\s+R\b", buf[j:])
+    if mr:
+        return "ref", int(mr.group(1))
+    mn = re.match(rb"/([^\s/<>\[\]()]+)", buf[j:])
+    if mn:
+        return "name", mn.group(1)
+    return None
+
+
+def _pdf_dict(objs, val):
+    if val is None:
+        return None
+    kind, v = val
+    if kind == "dict":
+        return v
+    if kind == "ref":
+        body = objs.get(v)
+        if body is None:
+            return None
+        m = re.search(rb"<<", body)
+        return _balanced(body, m.start(), b"<<", b">>")[0] if m else None
+    return None
+
+
+def _pdf_stream_data(objbody):
+    m = PDF_STREAM.search(objbody)
+    if not m:
+        return None
+    data = m.group(1)
+    fv = _pdf_value(objbody, b"Filter")
+    names = []
+    if fv:
+        kind, v = fv
+        names = [v] if kind == "name" else re.findall(rb"/([^\s/<>\[\]()]+)", v) if kind == "array" else []
+    if not names:
         try:
-            buf = zlib.decompress(buf)
+            return zlib.decompress(data)
         except Exception:
-            pass  # not FlateDecode — treat as an uncompressed content stream
-        harvest(buf)
+            return data
+    for name in names:
+        try:
+            if name == b"FlateDecode":
+                data = zlib.decompress(data)
+            elif name == b"ASCII85Decode":
+                s = bytes(data).translate(None, b" \t\r\n\v\f")
+                if s.startswith(b"<~"):
+                    s = s[2:]
+                if s.endswith(b"~>"):
+                    s = s[:-2]
+                data = base64.a85decode(s)
+            else:
+                return None  # DCTDecode and friends carry no text
+        except Exception:
+            return None
+    return data
 
-    text = "".join(ch for ch in "".join(parts) if ch.isprintable() or ch in "\n ")
-    text = re.sub(r"[ \t]{2,}", " ", text)
+
+def _pdf_objects(data):
+    objs = {int(m.group(1)): m.group(2) for m in PDF_OBJ.finditer(data)}
+    # object streams hold dict-only objects (page/font dicts in modern writers)
+    for body in [b for b in objs.values() if re.search(rb"/Type\s*/ObjStm\b", b)]:
+        payload = _pdf_stream_data(body)
+        if payload is None:
+            continue
+        fm = re.search(rb"/First\s+(\d+)", body)
+        nm = re.search(rb"/N\s+(\d+)", body)
+        if not fm or not nm:
+            continue
+        first, n = int(fm.group(1)), int(nm.group(1))
+        header = payload[:first].split()
+        if len(header) < 2 * n:
+            continue
+        try:
+            pairs = [(int(header[2 * i]), int(header[2 * i + 1])) for i in range(n)]
+        except ValueError:
+            continue
+        for i, (onum, off) in enumerate(pairs):
+            end = pairs[i + 1][1] if i + 1 < len(pairs) else len(payload) - first
+            objs.setdefault(onum, payload[first + off : first + end])
+    return objs
+
+
+def _parse_tounicode(data):
+    """ToUnicode CMap stream → ({code bytes: text}, code lengths ascending), or None."""
+    cmap, lens = {}, set()
+    for m in re.finditer(rb"begincodespacerange(.*?)endcodespacerange", data, re.DOTALL):
+        for h in PDF_HEXSTR.finditer(m.group(1)):
+            lens.add(len(_hexbytes(h.group(1))))
+    for m in re.finditer(rb"beginbfchar(.*?)endbfchar", data, re.DOTALL):
+        toks = PDF_HEXSTR.findall(m.group(1))
+        for i in range(0, len(toks) - 1, 2):
+            src = _hexbytes(toks[i])
+            cmap[src] = _hexbytes(toks[i + 1]).decode("utf-16-be", errors="ignore")
+            lens.add(len(src))
+    for m in re.finditer(rb"beginbfrange(.*?)endbfrange", data, re.DOTALL):
+        toks = list(re.finditer(rb"<([0-9A-Fa-f]+)>|(\[)|(\])", m.group(1)))
+        k = 0
+        while k + 2 < len(toks):  # an entry needs lo, hi, dst
+            if not (toks[k].group(1) and toks[k + 1].group(1)):
+                k += 1
+                continue
+            lo_b = _hexbytes(toks[k].group(1))
+            lo = int.from_bytes(lo_b, "big")
+            hi = int.from_bytes(_hexbytes(toks[k + 1].group(1)), "big")
+            lens.add(len(lo_b))
+            k += 2
+            if hi - lo > 0xFFFF:
+                k += 1
+                continue
+            if toks[k].group(2):  # [ <dst> <dst> ... ] — one destination per code
+                k += 1
+                code = lo
+                while k < len(toks) and not toks[k].group(3):
+                    if toks[k].group(1):
+                        cmap[code.to_bytes(len(lo_b), "big")] = _hexbytes(
+                            toks[k].group(1)).decode("utf-16-be", errors="ignore")
+                    code += 1
+                    k += 1
+                k += 1
+            elif toks[k].group(1):
+                dst = _hexbytes(toks[k].group(1))
+                base = int.from_bytes(dst, "big")
+                for code in range(lo, hi + 1):
+                    cmap[code.to_bytes(len(lo_b), "big")] = (
+                        base + code - lo).to_bytes(len(dst), "big").decode("utf-16-be", errors="ignore")
+                k += 1
+    return (cmap, sorted(lens)) if cmap else None
+
+
+def _cmap_decode(bs, cmap, lens):
+    out, i, L = [], 0, len(bs)
+    while i < L:
+        for l in lens:
+            piece = bs[i : i + l]
+            if piece in cmap:
+                out.append(cmap[piece])
+                i += l
+                break
+        else:
+            i += lens[0]  # unmapped code (subset font gap) — skip, stay aligned
+    return "".join(out)
+
+
+def _font_cmaps(objs, res_body, cache):
+    """Resources dict → {font resource name: parsed ToUnicode CMap or None}."""
+    fonts = {}
+    fdict = _pdf_dict(objs, _pdf_value(res_body, b"Font")) if res_body is not None else None
+    if fdict is None:
+        return fonts
+    for m in re.finditer(rb"/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R", fdict):
+        name, fnum = m.group(1), int(m.group(2))
+        if fnum not in cache:
+            cache[fnum] = None
+            fobj = objs.get(fnum)
+            tu = _pdf_value(fobj, b"ToUnicode") if fobj is not None else None
+            if tu and tu[0] == "ref" and objs.get(tu[1]) is not None:
+                stream = _pdf_stream_data(objs[tu[1]])
+                if stream:
+                    cache[fnum] = _parse_tounicode(stream)
+        fonts[name] = cache[fnum]
+    return fonts
+
+
+def _pdf_text_jobs(objs):
+    """(content stream, font map) per page and per reachable Form XObject."""
+    jobs, cache, seen = [], {}, set()
+
+    def add_xobjects(res_body, inherited, depth):
+        if res_body is None or depth > 3:
+            return
+        xdict = _pdf_dict(objs, _pdf_value(res_body, b"XObject"))
+        if xdict is None:
+            return
+        for m in re.finditer(rb"/[^\s/<>\[\]()]+\s+(\d+)\s+\d+\s+R", xdict):
+            xnum = int(m.group(1))
+            if xnum in seen:
+                continue
+            seen.add(xnum)
+            xobj = objs.get(xnum)
+            if xobj is None or not re.search(rb"/Subtype\s*/Form\b", xobj):
+                continue
+            xres = _pdf_dict(objs, _pdf_value(xobj, b"Resources"))
+            fonts = _font_cmaps(objs, xres, cache) or inherited
+            data = _pdf_stream_data(xobj)
+            if data:
+                jobs.append((data, fonts))
+            add_xobjects(xres, fonts, depth + 1)
+
+    for _, body in sorted(objs.items()):
+        if not re.search(rb"/Type\s*/Page\b", body):
+            continue
+        res = _pdf_dict(objs, _pdf_value(body, b"Resources"))
+        fonts = _font_cmaps(objs, res, cache)
+        cv = _pdf_value(body, b"Contents")
+        crefs = ([cv[1]] if cv and cv[0] == "ref"
+                 else [int(g) for g in re.findall(rb"(\d+)\s+\d+\s+R", cv[1])] if cv and cv[0] == "array"
+                 else [])
+        for cn in crefs:
+            data = _pdf_stream_data(objs[cn]) if objs.get(cn) is not None else None
+            if data:
+                jobs.append((data, fonts))
+        add_xobjects(res, fonts, 1)
+    return jobs
+
+
+PDF_OPS = re.compile(
+    rb"/([^\s/<>\[\]()]+)\s+[-\d.]+\s+Tf"
+    rb"|\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|\")"
+    rb"|<([0-9A-Fa-f\s]*)>\s*(?:Tj|'|\")"
+    rb"|\[((?:\\.|[^\\\]])*)\]\s*TJ"
+    rb"|(ET)",
+    re.DOTALL,
+)
+PDF_TJ_ITEM = re.compile(rb"\(((?:\\.|[^\\()])*)\)|<([0-9A-Fa-f\s]*)>", re.DOTALL)
+
+
+def _decode_content(buf, fonts, emit_plain, parts):
+    """Walk one content stream in operator order, decoding shown text through the
+    font selected by the last Tf. Fonts without a ToUnicode CMap fall back to the
+    wordish-gated literal path (0.7.0 behavior)."""
+    cur = None
+
+    def show(lit, hexs):
+        if cur:
+            cmap, lens = cur
+            bs = _pdf_unescape(lit) if lit is not None else _hexbytes(hexs)
+            s = _cmap_decode(bs, cmap, lens)
+            if s:
+                parts.append(s)
+                # per-glyph writers (Keynote) emit one show op per character with
+                # real space glyphs — separating those would shatter every word;
+                # multi-char runs get a separator since theirs may be positional
+                if len(s) > 1:
+                    parts.append(" ")
+        elif lit is not None:
+            emit_plain(lit)
+            parts.append(" ")
+
+    for m in PDF_OPS.finditer(buf):
+        fname, lit, hexs, arr, et = m.groups()
+        if fname is not None:
+            cur = fonts.get(fname)
+        elif et is not None:
+            parts.append("\n")
+        elif arr is not None:
+            for im in PDF_TJ_ITEM.finditer(arr):
+                show(im.group(1), im.group(2))
+        else:
+            show(lit, hexs)
+
+
+def extract_pdf_text(data: bytes):
+    """Deterministic ladder: per-font ToUnicode CMap decoding (Page→Resources→Font
+    chain, Form XObjects included) → raw literal-string harvest of every stream →
+    name-only. Each rung is wordish-gated so image/binary streams never leak.
+
+    Returns (text, title, ok, pages) — pages is per-content-stream text when the
+    CMap rung wins (a slide/page is the natural search section), else None."""
+
+    def clean(parts):
+        text = "".join(ch for ch in "".join(parts) if ch.isprintable() or ch in "\n ")
+        return re.sub(r"[ \t]{2,}", " ", text)
+
+    def emit_into(parts):
+        def emit(raw):
+            s = _pdf_str(raw)
+            if _pdf_wordish(s):
+                parts.append(s)
+        return emit
+
+    try:
+        jobs = _pdf_text_jobs(_pdf_objects(data))
+    except Exception:
+        jobs = []  # malformed object graph — the raw harvest rung still runs
+    pages = []
+    for buf, fonts in jobs:
+        parts = []
+        _decode_content(buf, fonts, emit_into(parts), parts)
+        page = clean(parts).strip("\n")
+        if page.strip():
+            pages.append(page)
+    text = "\n".join(pages)
     ok = len(PDF_WORD.findall(text)) >= 5
+    if not (ok and _pdf_wordish(text)):
+        pages, parts = None, []
+        emit = emit_into(parts)
+
+        def harvest(buf):
+            if b"BT" not in buf:
+                return
+            for block in PDF_TEXTBLOCK.finditer(buf):
+                b = block.group(1)
+                for m in PDF_SHOWTEXT.finditer(b):
+                    emit(m.group(1))
+                    parts.append(" ")
+                for arr in PDF_ARRAY.finditer(b):
+                    body = arr.group(1)
+                    if b"(" not in body:
+                        continue
+                    for lit in PDF_LITERAL.finditer(body):
+                        emit(lit.group(1))
+                    parts.append(" ")
+                parts.append("\n")
+
+        for m in PDF_STREAM.finditer(data):
+            buf = m.group(1)
+            try:
+                buf = zlib.decompress(buf)
+            except Exception:
+                pass  # not FlateDecode — treat as an uncompressed content stream
+            harvest(buf)
+        text = clean(parts)
+        ok = len(PDF_WORD.findall(text)) >= 5
+
     title = ""
     tm = PDF_TITLE.search(data)
     if tm:
         title = " ".join(_pdf_str(tm.group(1)).split())
         if not _pdf_wordish(title):
             title = ""
-    return text if ok else "", title, ok
+    return (text, title, ok, pages) if ok else ("", title, ok, None)
 
 
 def stem_words(stem: str) -> str:
@@ -431,8 +750,15 @@ def parse_file(root: Path, path: Path):
 
     if suffix == ".pdf":
         data = path.read_bytes()
-        text, pdf_title, ok = extract_pdf_text(data)
-        if ok:
+        text, pdf_title, ok, pages = extract_pdf_text(data)
+        if ok and pages:
+            sections, start = [], 1
+            for pg in pages:
+                pg_lines = pg.splitlines()
+                heading = next((l.strip()[:60] for l in pg_lines if l.strip()), "(page)")
+                sections.append((rel, start, 1, heading, pg))
+                start += len(pg_lines)
+        elif ok:
             sections = parse_plain_sections(rel, text.splitlines())
         else:
             sections = [(rel, 1, 1, "(pdf)", stem_words(path.stem))]

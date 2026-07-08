@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 WIKIMAP = str(Path(__file__).parent / "wikimap.py")
@@ -550,6 +551,102 @@ class TestPdfIndexing(VaultTest):
         self.assertIn("계약서-2026-스캔본.pdf", run(self.root, "search", "계약서"))
         self.assertIn("no results", run(self.root, "search", "binary scan blob"),
                       "binary noise must never leak into the index")
+
+
+def make_pdf(*objects):
+    body = b"%PDF-1.4\n"
+    for i, obj in enumerate(objects, 1):
+        body += b"%d 0 obj %s endobj\n" % (i, obj)
+    return body + b"trailer << >>\n%%EOF\n"
+
+
+CID_CMAP = (b"<< >> stream\n"
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"3 beginbfchar <0041> <D55C> <0042> <AE00> <0001> <0020> endbfchar\n"
+            b"1 beginbfrange <0050> <0052> <AC00> endbfrange\n"
+            b"endstream")
+
+
+class TestPdfCmapDecoding(VaultTest):
+    def test_cid_hex_tj_decoded_via_bfchar_and_bfrange(self):
+        pdf = make_pdf(
+            b"<< /Type /Page /Resources << /Font << /F1 3 0 R >> >> /Contents 2 0 R >>",
+            b"<< >> stream\nBT /F1 12 Tf "
+            b"<00410042 0001 00410042 0001 00410042 0001 00410042 0001 00410042 0001 005000510052> Tj"
+            b" ET\nendstream",
+            b"<< /Type /Font /Subtype /Type0 /ToUnicode 4 0 R >>",
+            CID_CMAP,
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/cid.pdf").write_bytes(pdf)
+        out = run(self.root, "update")
+        self.assertNotIn("text-extraction failed", out)
+        self.assertIn("docs/cid.pdf", run(self.root, "search", "한글"))
+        self.assertIn("docs/cid.pdf", run(self.root, "search", "가각갂"),
+                      "bfrange-mapped codes must decode too")
+
+    def test_per_font_cmaps_not_unioned(self):
+        # same code 0x0041 means a different char in each font — union decoding
+        # would corrupt one of them (the spike's 'Rakdrensbd' failure)
+        pdf = make_pdf(
+            b"<< /Type /Page /Resources << /Font << /F1 3 0 R /F2 5 0 R >> >>"
+            b" /Contents 2 0 R >>",
+            b"<< >> stream\nBT /F1 12 Tf <00410041 0001 00410041 0001 00410041> Tj "
+            b"/F2 12 Tf <00410041 0001 00410041 0001 00410041> Tj ET\nendstream",
+            b"<< /Type /Font /ToUnicode 4 0 R >>",
+            b"<< >> stream\n1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"2 beginbfchar <0041> <B098> <0001> <0020> endbfchar\nendstream",
+            b"<< /Type /Font /ToUnicode 6 0 R >>",
+            b"<< >> stream\n1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"2 beginbfchar <0041> <B2E4> <0001> <0020> endbfchar\nendstream",
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/two-fonts.pdf").write_bytes(pdf)
+        run(self.root, "update")
+        self.assertIn("docs/two-fonts.pdf", run(self.root, "search", "나나"))
+        self.assertIn("docs/two-fonts.pdf", run(self.root, "search", "다다"))
+
+    def test_ascii85_flate_filter_chain(self):
+        import base64
+        content = zlib.compress(b"BT (quarterly zebra target metrics dashboard alpha) Tj ET")
+        encoded = base64.a85encode(content) + b"~>"
+        pdf = make_pdf(
+            b"<< /Type /Page /Contents 2 0 R >>",
+            b"<< /Filter [/ASCII85Decode /FlateDecode] >> stream\n" + encoded + b"\nendstream",
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/a85.pdf").write_bytes(pdf)
+        run(self.root, "update")
+        self.assertIn("docs/a85.pdf", run(self.root, "search", "zebra target metrics"))
+
+    def test_form_xobject_text_reached(self):
+        pdf = make_pdf(
+            b"<< /Type /Page /Resources << /XObject << /X1 2 0 R >> >> >>",
+            b"<< /Subtype /Form /Resources << /Font << /F1 3 0 R >> >> stream\n"
+            b"BT /F1 12 Tf <00410042 0001 00410042 0001 00410042 0001 00410042 0001 00410042> Tj"
+            b" ET\nendstream",
+            b"<< /Type /Font /Subtype /Type0 /ToUnicode 4 0 R >>",
+            CID_CMAP,
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/form.pdf").write_bytes(pdf)
+        run(self.root, "update")
+        self.assertIn("docs/form.pdf", run(self.root, "search", "한글"),
+                      "text living only in a Form XObject must be indexed")
+
+    def test_type3_one_byte_literal_tj(self):
+        pdf = make_pdf(
+            b"<< /Type /Page /Resources << /Font << /F1 3 0 R >> >> /Contents 2 0 R >>",
+            b"<< >> stream\nBT /F1 12 Tf (AB AB AB AB AB) Tj ET\nendstream",
+            b"<< /Type /Font /Subtype /Type3 /ToUnicode 4 0 R >>",
+            b"<< >> stream\n1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"3 beginbfchar <41> <D0C0> <42> <C790> <20> <0020> endbfchar\nendstream",
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/type3.pdf").write_bytes(pdf)
+        run(self.root, "update")
+        self.assertIn("docs/type3.pdf", run(self.root, "search", "타자"),
+                      "1-byte literal Tj codes must decode through the Type3 ToUnicode")
 
 
 class TestImageIndexing(VaultTest):

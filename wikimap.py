@@ -11,6 +11,7 @@ Design: eager structure, lazy semantics.
 Single file, stdlib only.
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
@@ -19,21 +20,24 @@ import sys
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
-    ".claude", ".github", "__pycache__", ".venv", "venv",
+    ".claude", ".github", "__pycache__", ".venv", "venv", ".trash",
 }
-IGNORE_FILES = {"MAP.md"}
+IGNORE_FILES = {"MAP.md", ".wikimapignore"}
 PLAIN_EXTS = {".txt", ".rst", ".org", ".adoc"}
-INDEX_EXTS = {".md"} | PLAIN_EXTS
+HTML_EXTS = {".html", ".htm"}
+INDEX_EXTS = {".md"} | PLAIN_EXTS | HTML_EXTS
+MAP_DISABLED = "-"
 
 SKILL_TEMPLATE = r"""---
 name: wikimap
-description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain-text .txt/.rst/.org/.adoc indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
+description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain-text .txt/.rst/.org/.adoc and HTML indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
 ---
 
 # wikimap
@@ -45,13 +49,13 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 
 | Command | Purpose |
 |---------|---------|
-| `update` | incremental re-index + regenerate MAP.md (sha-diff, changed files only; prints coverage: indexed vs skipped; MAP.md ends with a Health section — orphans, broken links, stale semantics) |
+| `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
 | `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
-| `suggest [--doc path] [-n 10]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM) |
+| `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM); `--wikilink` prints paste-ready `[[links]]` for the doc body |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
 | `edges [--all] [--prune]` | list inferred connections |
 | `import-graphify <graph.json>` | one-time import of INFERRED edges from an existing graphify graph |
@@ -62,7 +66,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
-5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5`, read the candidates' relevant sections, and `edge add` only the genuinely related ones. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
+5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5 --wikilink`, read the candidates' relevant sections, and paste only the genuinely related `[[links]]` into the doc body (a "Related" line is fine) — explicit links are readable by every vault tool and survive re-indexing. Use `edge add` only when you can't edit the doc. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 """
 
@@ -199,12 +203,95 @@ def parse_plain_sections(rel, lines):
     return sections
 
 
+class _HTMLDoc(HTMLParser):
+    HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    BREAKS = {"p", "div", "li", "tr", "br", "section", "article",
+              "ul", "ol", "table", "blockquote", "pre", "hr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.hrefs = []
+        self.events = []
+        self._skip = 0
+        self._in_title = False
+        self._heading = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in self.HEADINGS:
+            self._heading = (int(tag[1]), self.getpos()[0], [])
+        elif tag == "a":
+            href = dict(attrs).get("href") or ""
+            if href:
+                self.hrefs.append(href)
+        if tag in self.BREAKS:
+            self.events.append(("text", "\n"))
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag == "title":
+            self._in_title = False
+        elif tag in self.HEADINGS and self._heading:
+            level, line, buf = self._heading
+            self.events.append(("heading", (level, line, " ".join("".join(buf).split()))))
+            self._heading = None
+        elif tag in self.BREAKS:
+            self.events.append(("text", "\n"))
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self.title += data
+        elif self._heading is not None:
+            self._heading[2].append(data)
+        else:
+            self.events.append(("text", data))
+
+
+def parse_html_doc(rel, text, stem):
+    doc = _HTMLDoc()
+    try:
+        doc.feed(text)
+        doc.close()
+    except Exception:
+        pass  # malformed HTML — keep whatever parsed before the error
+    chunks = [["(intro)", 0, 1, []]]
+    first_h1 = ""
+    for kind, payload in doc.events:
+        if kind == "text":
+            chunks[-1][3].append(payload)
+        else:
+            level, line, heading = payload
+            heading = heading or "(heading)"
+            if not first_h1 and level == 1:
+                first_h1 = heading
+            chunks.append([heading, level, line, []])
+    sections = []
+    for heading, level, line, buf in chunks:
+        content = "\n".join(l.strip() for l in "".join(buf).splitlines())
+        content = re.sub(r"\n{3,}", "\n\n", content).strip("\n")
+        if content or heading != "(intro)":
+            sections.append((rel, line, level, heading, content))
+    if len(chunks) == 1 and sections:
+        sections = parse_plain_sections(rel, sections[0][4].splitlines())
+    title = " ".join(doc.title.split()) or first_h1 or stem
+    return title, sections, doc.hrefs
+
+
 def parse_file(root: Path, path: Path):
     rel = path.relative_to(root).as_posix()
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
+    suffix = path.suffix.lower()
+    html_hrefs = []
 
-    if path.suffix.lower() == ".md":
+    if suffix == ".md":
         meta, body_start = parse_frontmatter(lines)
         title = meta.get("title") or ""
         sections = []
@@ -222,25 +309,39 @@ def parse_file(root: Path, path: Path):
         sections.append((rel, cur_line, cur_level, cur_heading, "\n".join(buf)))
         if not title:
             title = path.stem
+        scan_text = text
+    elif suffix in HTML_EXTS:
+        title, sections, html_hrefs = parse_html_doc(rel, text, path.stem)
+        scan_text = "\n".join(s[4] for s in sections)  # tag-stripped — raw HTML would false-match refs
     else:
         sections = parse_plain_sections(rel, lines)
         title = next((l.strip()[:80] for l in lines if l.strip()), path.stem)
+        scan_text = text
+
+    def resolve_doc_link(dst):
+        resolved = (path.parent / dst).resolve()
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            return norm_rel(dst)
 
     links = []
-    for m in WIKILINK.finditer(text):
+    for m in WIKILINK.finditer(scan_text):
         links.append((rel, m.group(1).strip(), "wiki"))
     for m in MDLINK.finditer(text):
         dst = m.group(1)
         if not dst.startswith("http"):
-            resolved = (path.parent / dst).resolve()
-            try:
-                dst = resolved.relative_to(root).as_posix()
-            except ValueError:
-                dst = norm_rel(dst)
-            links.append((rel, dst, "md"))
-    for m in set(CODEREF.findall(text)):
+            links.append((rel, resolve_doc_link(dst), "md"))
+    for href in html_hrefs:
+        href = href.split("#")[0].split("?")[0]
+        if not href or href.startswith(("http://", "https://", "mailto:", "//")):
+            continue
+        if Path(href).suffix.lower() not in ({".md"} | HTML_EXTS):
+            continue
+        links.append((rel, resolve_doc_link(href), "md"))
+    for m in set(CODEREF.findall(scan_text)):
         links.append((rel, m, "code"))
-    for m in set(REQID.findall(text)):
+    for m in set(REQID.findall(scan_text)):
         links.append((rel, m, "req"))
 
     return {
@@ -254,13 +355,37 @@ def parse_file(root: Path, path: Path):
     }
 
 
-def scan_files(root: Path, skipped: Counter = None):
+def load_ignore_patterns(root: Path, cli_ignores=None):
+    pats = [p.strip().rstrip("/") for p in (cli_ignores or []) if p.strip()]
+    f = root / ".wikimapignore"
+    if f.is_file():
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip().rstrip("/")
+            if ln and not ln.startswith("#"):
+                pats.append(ln)
+    return pats
+
+
+def is_ignored(rel_parts, rel_posix, patterns):
+    for pat in patterns:
+        if "/" in pat or any(ch in pat for ch in "*?["):
+            if fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(rel_posix, pat + "/*"):
+                return True
+        elif pat in rel_parts:
+            return True
+    return False
+
+
+def scan_files(root: Path, skipped: Counter = None, ignore_patterns=None, skip_rels=frozenset()):
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
-        if any(part in IGNORE_DIRS for part in p.relative_to(root).parts):
+        rel = p.relative_to(root)
+        if any(part in IGNORE_DIRS for part in rel.parts):
             continue
-        if p.name in IGNORE_FILES:
+        if p.name in IGNORE_FILES or rel.as_posix() in skip_rels:
+            continue
+        if ignore_patterns and is_ignored(rel.parts, rel.as_posix(), ignore_patterns):
             continue
         if p.suffix.lower() not in INDEX_EXTS:
             if skipped is not None:
@@ -432,6 +557,18 @@ def cmd_suggest(root, db, args):
     if not top:
         print("no candidates")
         return
+    if args.wikilink:
+        for (a, b), s in top:
+            if doc_filter and doc_filter in (a, b):
+                other = b if a == doc_filter else a
+                print(f"[[{Path(other).stem}]]  # {other} — {', '.join(why[(a, b)][:4])} ({s:.1f})")
+            else:
+                print(f"[[{Path(a).stem}]] ↔ [[{Path(b).stem}]] — {', '.join(why[(a, b)][:4])} ({s:.1f})")
+        print(
+            "\nPaste the genuine ones into the doc body — explicit [[links]] are readable "
+            "by every vault tool; use edge add only when you can't edit the doc"
+        )
+        return
     for (a, b), s in top:
         print(f"({s:.1f}) {a}")
         print(f"      ↔ {b}")
@@ -479,12 +616,41 @@ def cmd_edges(root, db, args):
         print(f"({len(r['stale'])} stale edges hidden — use --all to show, --prune to delete)")
 
 
+def map_setting(db):
+    row = db.execute("SELECT value FROM meta WHERE key='map_path'").fetchone()
+    return row[0] if row else "MAP.md"
+
+
+def apply_map_flags(root, db, args):
+    if getattr(args, "no_map", False):
+        new = MAP_DISABLED
+    elif getattr(args, "map_path", None):
+        new = norm_rel(args.map_path)
+    else:
+        return
+    prev = map_setting(db)
+    if new == prev:
+        return
+    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('map_path', ?)", (new,))
+    old = root / prev
+    if prev != MAP_DISABLED and old.is_file():
+        try:
+            if old.read_text(encoding="utf-8", errors="replace").startswith("# Wiki Map"):
+                old.unlink()  # generated artifact only — never delete a user file
+        except OSError:
+            pass
+
+
 def cmd_update(root, db, args):
     t0 = time.time()
+    apply_map_flags(root, db, args)
+    patterns = load_ignore_patterns(root, getattr(args, "ignore", None))
+    map_rel = map_setting(db)
+    skip_rels = frozenset({map_rel} if map_rel != MAP_DISABLED else ())
     skipped = Counter()
     seen, changed_rels = set(), []
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
-    for p in scan_files(root, skipped):
+    for p in scan_files(root, skipped, patterns, skip_rels):
         rel = p.relative_to(root).as_posix()
         seen.add(rel)
         prev = known.get(rel)
@@ -529,12 +695,13 @@ def cmd_update(root, db, args):
     ms = int((time.time() - t0) * 1000)
     n_skipped = sum(skipped.values())
     top = ", ".join(f"{ext} {n}" for ext, n in skipped.most_common(3))
+    map_note = "map disabled" if map_rel == MAP_DISABLED else f"{map_rel} updated"
     print(
         f"wikimap: {total} files indexed ({len(changed_rels)} changed, {len(deleted)} deleted) "
         f"in {ms}ms | skipped {n_skipped} non-indexed files"
         + (f" ({top})" if top else "")
         + f" | notes: {fresh} fresh, {stale} stale | "
-        f"edges: {len(e['fresh'])} fresh, {len(e['stale'])} stale | MAP.md updated"
+        f"edges: {len(e['fresh'])} fresh, {len(e['stale'])} stale | {map_note}"
     )
 
 
@@ -580,6 +747,9 @@ def vault_health(db):
 
 
 def write_map(root, db):
+    map_rel = map_setting(db)
+    if map_rel == MAP_DISABLED:
+        return
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     total, words = db.execute("SELECT COUNT(*), COALESCE(SUM(words),0) FROM files").fetchone()
     out = [
@@ -666,7 +836,9 @@ def write_map(root, db):
            if h["stale_notes"] or h["stale_edges"] else "")
     )
 
-    (root / "MAP.md").write_text("\n".join(out) + "\n", encoding="utf-8")
+    target = root / map_rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def candidate_paths(db, terms, titles):
@@ -942,8 +1114,16 @@ def main():
     ins = sub.add_parser("install", help="install as a Claude Code skill (~/.claude/skills/wikimap)")
     ins.add_argument("--project", action="store_true", help="install to ./.claude instead of ~/.claude")
 
-    sub.add_parser("update", help="incremental re-index + regenerate MAP.md")
-    sub.add_parser("map", help="regenerate MAP.md only")
+    up = sub.add_parser("update", help="incremental re-index + regenerate the map file")
+    up.add_argument("--ignore", action="append", default=[], metavar="DIR_OR_GLOB",
+                    help="extra exclude for this run (repeatable); persistent version: "
+                         "a .wikimapignore file at the vault root, one dir/glob per line")
+    up.add_argument("--map-path", dest="map_path", metavar="REL_PATH",
+                    help="write the map to this vault-relative path instead of MAP.md "
+                         "(persisted in the index; the old generated map is removed)")
+    up.add_argument("--no-map", dest="no_map", action="store_true",
+                    help="stop generating a map file (persisted; re-enable with --map-path MAP.md)")
+    sub.add_parser("map", help="regenerate the map file only (honors the persisted --map-path)")
 
     sp = sub.add_parser("search", help="ranked section search")
     sp.add_argument("query")
@@ -976,6 +1156,8 @@ def main():
     sg.add_argument("--doc", help="limit to pairs involving this vault-relative path")
     sg.add_argument("-n", type=int, default=10)
     sg.add_argument("--max-df", type=int, default=4, dest="max_df")
+    sg.add_argument("--wikilink", action="store_true",
+                    help="print candidates as paste-ready [[wikilinks]] for the doc body")
 
     ea = sub.add_parser("edge", help="confirm an inferred connection (sha-pinned both ends)")
     ea.add_argument("add", choices=["add"])
@@ -999,7 +1181,8 @@ def main():
             cmd_update(root, db, args)
         elif args.cmd == "map":
             write_map(root, db)
-            print("MAP.md updated")
+            m = map_setting(db)
+            print("map disabled" if m == MAP_DISABLED else f"{m} updated")
         elif args.cmd == "search":
             cmd_search(root, db, args)
         elif args.cmd == "links":

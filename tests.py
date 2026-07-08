@@ -229,6 +229,125 @@ class TestRecallGate(VaultTest):
         self.assertEqual(hits, len(self.GOLDEN))
 
 
+class TestIgnoreConfig(VaultTest):
+    def test_trash_ignored_by_default(self):
+        write(self.root, ".trash/deleted-doc.md", "# 삭제된 문서\n\nzxqtrashghost token")
+        run(self.root, "update")
+        self.assertIn("no results", run(self.root, "search", "zxqtrashghost"))
+
+    def test_wikimapignore_file(self):
+        write(self.root, "drafts/wip.md", "# wip\n\nzxqdraftmarker")
+        write(self.root, ".synapse/cortex.json.md", "# marker\n\nzxqmarkerfile")
+        write(self.root, ".wikimapignore", "# comment line\ndrafts\n.synapse/\n")
+        out = run(self.root, "update")
+        self.assertIn("4 files indexed", out)
+        self.assertIn("no results", run(self.root, "search", "zxqdraftmarker"))
+        self.assertIn("no results", run(self.root, "search", "zxqmarkerfile"))
+
+    def test_ignore_flag_and_reindex_on_removal(self):
+        write(self.root, "drafts/wip.md", "# wip\n\nzxqdraftmarker")
+        run(self.root, "update", "--ignore", "drafts")
+        self.assertIn("no results", run(self.root, "search", "zxqdraftmarker"))
+        run(self.root, "update")
+        self.assertIn("drafts/wip.md", run(self.root, "search", "zxqdraftmarker"))
+
+    def test_glob_pattern(self):
+        write(self.root, "notes/scratch.tmp.md", "# scratch\n\nzxqtmpmarker")
+        write(self.root, ".wikimapignore", "*.tmp.md\n")
+        run(self.root, "update")
+        self.assertIn("no results", run(self.root, "search", "zxqtmpmarker"))
+
+
+class TestMapPlacement(VaultTest):
+    def test_map_path_moves_and_persists(self):
+        run(self.root, "update")
+        self.assertTrue((self.root / "MAP.md").exists())
+        out = run(self.root, "update", "--map-path", ".wikimap/MAP.md")
+        self.assertIn(".wikimap/MAP.md updated", out)
+        self.assertFalse((self.root / "MAP.md").exists(), "old generated map should be removed")
+        self.assertIn("# Wiki Map", (self.root / ".wikimap/MAP.md").read_text(encoding="utf-8"))
+        out = run(self.root, "update")
+        self.assertIn(".wikimap/MAP.md updated", out)
+        self.assertFalse((self.root / "MAP.md").exists(), "setting must persist across runs")
+
+    def test_custom_map_not_indexed(self):
+        run(self.root, "update", "--map-path", "docs/vault-map.md")
+        out = run(self.root, "update")
+        self.assertIn("4 files indexed", out)
+        self.assertIn("no results", run(self.root, "search", "auto-generated"))
+
+    def test_no_map(self):
+        run(self.root, "update")
+        out = run(self.root, "update", "--no-map")
+        self.assertIn("map disabled", out)
+        self.assertFalse((self.root / "MAP.md").exists())
+        run(self.root, "update", "--map-path", "MAP.md")
+        self.assertTrue((self.root / "MAP.md").exists())
+
+    def test_user_file_at_old_map_path_survives(self):
+        write(self.root, "MAP.md", "# my hand-written map\n")
+        run(self.root, "update", "--map-path", ".wikimap/MAP.md")
+        self.assertEqual(
+            (self.root / "MAP.md").read_text(encoding="utf-8"), "# my hand-written map\n"
+        )
+
+
+class TestHtmlIndexing(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "reports/quarterly.html", "\n".join([
+            "<!doctype html><html><head>",
+            "<title>분기 리포트 Q3</title>",
+            "<style>body { color: red; } .zxqcssnoise {}</style>",
+            "<script>var zxqjsnoise = 1;</script>",
+            "</head><body>",
+            "<h1>분기 리포트</h1>",
+            "<p>매출 요약과 결제 전환율 분석. REQ-01 반영 결과.</p>",
+            "<h2>세부 지표</h2>",
+            "<p>zxqhtmlneedle 지표는 <a href='../specs/auth-spec.md'>인증 스펙</a> 참고.</p>",
+            "<p>대시보드는 <a href='dashboard.html'>여기</a>, 외부는 <a href='https://x.com/a.md'>링크</a>.</p>",
+            "</body></html>",
+        ]))
+        write(self.root, "reports/dashboard.html",
+              "<html><head><title>대시보드</title></head><body><p>지표 모음 zxqdash</p></body></html>")
+        run(self.root, "update")
+
+    def test_indexed_and_searchable(self):
+        out = run(self.root, "update")
+        self.assertIn("6 files indexed", out)
+        self.assertNotIn(".html", out.split("|")[1], "html must not appear in the skipped list")
+        hit = run(self.root, "search", "zxqhtmlneedle")
+        self.assertIn("reports/quarterly.html", hit)
+        self.assertIn("세부 지표", hit, "heading sectioning should survive tag stripping")
+
+    def test_title_and_noise_stripped(self):
+        out = run(self.root, "search", "분기 리포트")
+        self.assertIn("reports/quarterly.html", out)
+        self.assertIn("no results", run(self.root, "search", "zxqcssnoise"))
+        self.assertIn("no results", run(self.root, "search", "zxqjsnoise"))
+
+    def test_anchor_links_join_graph(self):
+        out = run(self.root, "links", "reports/quarterly.html")
+        self.assertIn("[linked|md] specs/auth-spec.md", out)
+        self.assertIn("[linked|md] reports/dashboard.html", out)
+        self.assertNotIn("x.com", out)
+        out = run(self.root, "path", "dashboard", "auth-plan")
+        self.assertIn("hops)", out)
+
+    def test_req_id_from_html(self):
+        self.assertIn("appears in 3 docs", run(self.root, "links", "REQ-01"))
+
+
+class TestSuggestWikilink(VaultTest):
+    def test_paste_ready_output(self):
+        write(self.root, "a/topic-alpha.md", "# alpha\n\nzxqsharedterm appears here twice zxqsharedterm")
+        write(self.root, "b/topic-beta.md", "# beta\n\nzxqsharedterm appears here twice zxqsharedterm")
+        run(self.root, "update")
+        out = run(self.root, "suggest", "--doc", "a/topic-alpha.md", "--wikilink")
+        self.assertIn("[[topic-beta]]", out)
+        self.assertNotIn("edge add --src", out.splitlines()[0])
+
+
 class TestInstallPreservesSkill(unittest.TestCase):
     def test_existing_skill_untouched(self):
         tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))

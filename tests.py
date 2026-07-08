@@ -348,6 +348,138 @@ class TestSuggestWikilink(VaultTest):
         self.assertNotIn("edge add --src", out.splitlines()[0])
 
 
+class TestSemanticsFileSSOT(VaultTest):
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def add_semantics(self):
+        run(self.root, "note", "add", "--question", "세션 만료 정책은?",
+            "--insight", "30분, REQ-01", "--sources", "specs/auth-spec.md")
+        run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
+            "--dst", "specs/auth-spec.md", "--rationale", "test edge")
+
+    def test_note_and_edge_land_in_jsonl(self):
+        self.add_semantics()
+        p = self.root / ".wikimap" / "semantics.jsonl"
+        recs = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual({r["type"] for r in recs}, {"note", "edge"})
+
+    def test_db_is_a_disposable_cache(self):
+        self.add_semantics()
+        (self.root / ".wikimap" / "index.db").unlink()
+        run(self.root, "update")
+        self.assertIn("[NOTE fresh", run(self.root, "search", "세션 만료"))
+        out = run(self.root, "edges")
+        self.assertIn("[fresh|claude]", out)
+        self.assertIn("test edge", out)
+
+    def test_migration_from_pre_060_db(self):
+        db = sqlite3.connect(self.root / ".wikimap" / "index.db")
+        sha = db.execute("SELECT sha FROM files WHERE path='specs/auth-spec.md'").fetchone()[0]
+        sha2 = db.execute("SELECT sha FROM files WHERE path='plans/auth-plan.md'").fetchone()[0]
+        db.execute(
+            "INSERT INTO edges(src,dst,relation,rationale,origin,created,src_sha,dst_sha)"
+            " VALUES('plans/auth-plan.md','specs/auth-spec.md','rel','legacy row','claude','x',?,?)",
+            (sha2, sha),
+        )
+        db.commit()
+        db.close()
+        self.assertFalse((self.root / ".wikimap" / "semantics.jsonl").exists())
+        out = run(self.root, "edges")
+        self.assertIn("legacy row", out)
+        recs = [json.loads(l) for l in
+                (self.root / ".wikimap" / "semantics.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["rationale"], "legacy row")
+
+    def test_prune_rewrites_the_file(self):
+        self.add_semantics()
+        write(self.root, "notes/orphan-note.md", "# 고립 문서\n\nsha가 바뀌어 엣지가 stale.")
+        run(self.root, "update")
+        run(self.root, "edges", "--prune")
+        recs = [json.loads(l) for l in
+                (self.root / ".wikimap" / "semantics.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([r["type"] for r in recs], ["note"], "stale edge must leave the file too")
+
+
+class TestEdgeRepin(VaultTest):
+    def test_repin_keeps_rationale_and_refreshes_shas(self):
+        run(self.root, "update")
+        run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
+            "--dst", "specs/auth-spec.md", "--rationale", "connection survives edits")
+        write(self.root, "notes/orphan-note.md", "# 고립 문서\n\n편집 후에도 관계는 유효.")
+        run(self.root, "update")
+        self.assertIn("1 stale edges hidden", run(self.root, "edges"))
+        out = run(self.root, "edge", "repin", "--src", "notes/orphan-note.md",
+                  "--dst", "specs/auth-spec.md")
+        self.assertIn("repinned 1 edge(s)", out)
+        out = run(self.root, "edges")
+        self.assertIn("[fresh|claude]", out)
+        self.assertIn("connection survives edits", out)
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertIn("stale semantics: 0 notes, 0 edges", map_md)
+
+
+class TestJsonOutput(VaultTest):
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def test_search_json(self):
+        data = json.loads(run(self.root, "search", "로그인 정책", "--json"))
+        self.assertEqual(data["query"], "로그인 정책")
+        top = data["results"][0]
+        self.assertEqual(top["path"], "specs/auth-spec.md")
+        for key in ("line", "heading", "score", "matched"):
+            self.assertIn(key, top)
+
+    def test_links_json(self):
+        data = json.loads(run(self.root, "links", "REQ-01", "--json"))
+        self.assertEqual(len(data["docs"]), 2)
+        data = json.loads(run(self.root, "links", "specs/auth-spec.md", "--json"))
+        self.assertTrue(any(l["source"] == "plans/auth-plan.md" for l in data["backlinks"]))
+
+    def test_path_json(self):
+        data = json.loads(run(self.root, "path", "auth-spec", "auth-plan", "--json"))
+        self.assertTrue(data["found"])
+        self.assertEqual(data["hops"], 1)
+        self.assertEqual(len(data["chain"]), 2)
+
+    def test_suggest_notes_edges_json(self):
+        run(self.root, "note", "add", "--question", "q", "--insight", "i",
+            "--sources", "specs/auth-spec.md")
+        run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
+            "--dst", "specs/auth-spec.md", "--rationale", "r")
+        self.assertEqual(json.loads(run(self.root, "notes", "--json"))["notes"][0]["question"], "q")
+        self.assertEqual(json.loads(run(self.root, "edges", "--json"))["edges"][0]["rationale"], "r")
+        self.assertIn("candidates", json.loads(run(self.root, "suggest", "--json")))
+
+
+class TestInstallHook(VaultTest):
+    def test_appends_to_existing_hook(self):
+        run(self.root, "update")
+        hooks = self.root / ".git" / "hooks"
+        hooks.mkdir(parents=True)
+        custom = "#!/bin/sh\necho my-existing-hook\n"
+        (hooks / "post-commit").write_text(custom, encoding="utf-8")
+        run(self.root, "install", "--hook")
+        text = (hooks / "post-commit").read_text(encoding="utf-8")
+        self.assertIn("echo my-existing-hook", text, "existing hook must be preserved")
+        self.assertIn("wikimap", text)
+        out = run(self.root, "install", "--hook")
+        self.assertIn("already installed", out)
+        self.assertEqual(text, (hooks / "post-commit").read_text(encoding="utf-8"))
+
+    def test_fresh_hook_and_non_git_vault(self):
+        (self.root / ".git").mkdir()
+        run(self.root, "install", "--hook")
+        hook = self.root / ".git" / "hooks" / "post-commit"
+        self.assertIn("update", hook.read_text(encoding="utf-8"))
+        with self.assertRaises(AssertionError):
+            run(self.tmp, "install", "--hook")
+
+
 class TestInstallPreservesSkill(unittest.TestCase):
     def test_existing_skill_untouched(self):
         tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))

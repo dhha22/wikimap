@@ -6,11 +6,10 @@ Usage:
   python3 bench.py --root <vault> --cold             # also time a from-scratch build
   python3 bench.py --root <vault> --queries q.tsv    # recall@5 (query<TAB>expected-path-substring per line)
 
---cold deletes <vault>/.wikimap first. The index is disposable by design,
-but notes/edges live in it too — skip --cold if you have semantics saved.
+--cold deletes <vault>/.wikimap/index.db first — safe: the DB is a disposable
+cache; notes/edges live in .wikimap/semantics.jsonl and are rebuilt into it.
 """
 import argparse
-import shutil
 import subprocess
 import sys
 import time
@@ -37,7 +36,7 @@ def main():
     root = Path(args.root).expanduser().resolve()
 
     if args.cold:
-        shutil.rmtree(root / ".wikimap", ignore_errors=True)
+        (root / ".wikimap" / "index.db").unlink(missing_ok=True)
         dt, out = run(root, "update")
         print(f"cold build   : {dt:6.2f}s  {out.strip()}")
     dt, out = run(root, "update")

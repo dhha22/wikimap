@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -57,8 +57,14 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | `notes [--all] [--prune]` | list notes / prune stale ones |
 | `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM); `--wikilink` prints paste-ready `[[links]]` for the doc body |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
+| `edge repin --src a.md --dst b.md` | after reviewing both ends of a stale edge: refresh the sha pins, keep the rationale |
 | `edges [--all] [--prune]` | list inferred connections |
 | `import-graphify <graph.json>` | one-time import of INFERRED edges from an existing graphify graph |
+| `install --hook` | git post-commit hook that runs `update` automatically (appends to an existing hook) |
+
+`search`/`links`/`path`/`suggest`/`notes`/`edges` accept `--json` for structured output — prefer it when a script consumes the result.
+
+Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable — the source of truth); `.wikimap/index.db` is a disposable cache rebuilt from files + that jsonl.
 
 ## Rules for the agent
 
@@ -68,6 +74,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
 5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5 --wikilink`, read the candidates' relevant sections, and paste only the genuinely related `[[links]]` into the doc body (a "Related" line is fine) — explicit links are readable by every vault tool and survive re-indexing. Use `edge add` only when you can't edit the doc. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
+7. **A stale edge whose connection still holds**: if it went stale only because an endpoint was edited, review both docs and run `edge repin --src a --dst b` — the rationale is kept, only the sha pins refresh. Re-add only when the relationship itself changed.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -403,12 +410,16 @@ def resolve_stem(stems, dst):
     return stems.get(Path(dst).stem.lower())
 
 
-def note_is_fresh(db, sources_json):
-    for s in json.loads(sources_json):
-        row = db.execute("SELECT sha FROM files WHERE path=?", (s["path"],)).fetchone()
-        if not row or row[0] != s["sha"]:
+def sources_fresh(db, sources):
+    for s in sources:
+        row = db.execute("SELECT sha FROM files WHERE path=?", (s.get("path"),)).fetchone()
+        if not row or row[0] != s.get("sha"):
             return False
     return True
+
+
+def note_is_fresh(db, sources_json):
+    return sources_fresh(db, json.loads(sources_json))
 
 
 def edge_is_fresh(db, src, dst, src_sha, dst_sha):
@@ -428,6 +439,107 @@ def fresh_edges(db):
         key = "fresh" if edge_is_fresh(db, src, dst, ss, ds) else "stale"
         result[key].append((src, dst, rel, rat, origin))
     return result
+
+
+def semantics_path(root: Path) -> Path:
+    return root / ".wikimap" / "semantics.jsonl"
+
+
+def load_semantics(root: Path):
+    p = semantics_path(root)
+    if not p.is_file():
+        return []
+    recs = []
+    for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue  # a hand-edited bad line must not take the whole layer down
+        if isinstance(r, dict) and r.get("type") in ("note", "edge"):
+            recs.append(r)
+    return recs
+
+
+def compact_semantics(recs):
+    # append-only log: the last line wins per edge key (repin appends, never rewrites)
+    out, seen = [], set()
+    for r in reversed(recs):
+        if r["type"] == "edge":
+            key = (r.get("src"), r.get("dst"), r.get("relation"))
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(r)
+    out.reverse()
+    return out
+
+
+def write_semantics(root: Path, recs):
+    p = semantics_path(root)
+    p.parent.mkdir(exist_ok=True)
+    tmp = p.parent / (p.name + ".tmp")
+    tmp.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs), encoding="utf-8"
+    )
+    tmp.replace(p)
+
+
+def append_semantics(root: Path, rec):
+    p = semantics_path(root)
+    p.parent.mkdir(exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def sync_semantics(root: Path, db):
+    """notes/edges live in semantics.jsonl (the SSOT); DB tables are a derived cache."""
+    p = semantics_path(root)
+    if not p.is_file():
+        recs = []
+        for q, ins, created, src in db.execute(
+            "SELECT question, insight, created, sources FROM notes ORDER BY id"
+        ):
+            recs.append({"type": "note", "question": q, "insight": ins,
+                         "created": created, "sources": json.loads(src)})
+        for s, d, rel, rat, origin, created, ss, ds in db.execute(
+            "SELECT src, dst, relation, rationale, origin, created, src_sha, dst_sha "
+            "FROM edges ORDER BY id"
+        ):
+            recs.append({"type": "edge", "src": s, "dst": d, "relation": rel,
+                         "rationale": rat, "origin": origin, "created": created,
+                         "src_sha": ss, "dst_sha": ds})
+        if not recs:
+            return
+        write_semantics(root, recs)
+        print(f"migrated {len(recs)} semantic records to {norm_rel(p.relative_to(root))} "
+              "(file is now the source of truth; the DB is a rebuildable cache)",
+              file=sys.stderr)
+    sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    row = db.execute("SELECT value FROM meta WHERE key='semantics_sha'").fetchone()
+    if row and row[0] == sha:
+        return
+    db.execute("DELETE FROM notes")
+    db.execute("DELETE FROM edges")
+    for r in compact_semantics(load_semantics(root)):
+        if r["type"] == "note":
+            db.execute(
+                "INSERT INTO notes(question, insight, created, sources) VALUES(?,?,?,?)",
+                (r.get("question", ""), r.get("insight", ""), r.get("created", ""),
+                 json.dumps(r.get("sources", []), ensure_ascii=False)),
+            )
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO edges"
+                "(src, dst, relation, rationale, origin, created, src_sha, dst_sha)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (r.get("src"), r.get("dst"), r.get("relation"), r.get("rationale", ""),
+                 r.get("origin", ""), r.get("created", ""), r.get("src_sha"), r.get("dst_sha")),
+            )
+    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('semantics_sha', ?)", (sha,))
+    db.commit()
 
 
 def cmd_import_graphify(root, db, args):
@@ -461,17 +573,20 @@ def cmd_import_graphify(root, db, args):
             info["rationales"].append(f'{s.get("label")} --{l.get("relation","")}→ {t.get("label")}')
 
     shas = {p: sha for p, sha in db.execute("SELECT path, sha FROM files")}
+    existing = {(s, d, r) for s, d, r in db.execute("SELECT src, dst, relation FROM edges")}
     now = datetime.now(timezone.utc).isoformat()
     added = 0
     for (a, b), info in pairs.items():
         rel = max(set(info["relations"]), key=info["relations"].count)
-        cur = db.execute(
-            "INSERT OR IGNORE INTO edges(src,dst,relation,rationale,origin,created,src_sha,dst_sha)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (a, b, rel, " | ".join(info["rationales"]), "graphify-import", now, shas[a], shas[b]),
-        )
-        added += cur.rowcount
-    db.commit()
+        if (a, b, rel) in existing:
+            continue
+        append_semantics(root, {
+            "type": "edge", "src": a, "dst": b, "relation": rel,
+            "rationale": " | ".join(info["rationales"]), "origin": "graphify-import",
+            "created": now, "src_sha": shas[a], "dst_sha": shas[b],
+        })
+        added += 1
+    sync_semantics(root, db)
     write_map(root, db)
     print(
         f"imported {added} doc-pair edges (from {len(pairs)} pairs; "
@@ -554,6 +669,12 @@ def cmd_suggest(root, db, args):
             scores[key] *= 1.3
 
     top = sorted(scores.items(), key=lambda x: -x[1])[: args.n]
+    if args.json:
+        print(json.dumps({"doc": doc_filter, "candidates": [
+            {"a": a, "b": b, "score": round(s, 2), "signals": why[(a, b)][:6]}
+            for (a, b), s in top
+        ]}, ensure_ascii=False, indent=2))
+        return
     if not top:
         print("no candidates")
         return
@@ -579,39 +700,97 @@ def cmd_suggest(root, db, args):
     )
 
 
-def cmd_edge_add(root, db, args):
+def endpoint_shas(db, src, dst):
     shas = {}
-    src, dst = norm_rel(args.src), norm_rel(args.dst)
     for p in (src, dst):
         row = db.execute("SELECT sha FROM files WHERE path=?", (p,)).fetchone()
         if not row:
             sys.exit(f"not in index (run update first?): {p}")
         shas[p] = row[0]
+    return shas
+
+
+def cmd_edge_add(root, db, args):
+    if not args.rationale:
+        sys.exit("edge add requires --rationale")
+    src, dst = norm_rel(args.src), norm_rel(args.dst)
+    shas = endpoint_shas(db, src, dst)
     a, b = sorted([src, dst])
-    db.execute(
-        "INSERT OR REPLACE INTO edges(src,dst,relation,rationale,origin,created,src_sha,dst_sha)"
-        " VALUES(?,?,?,?,?,?,?,?)",
-        (a, b, args.relation, args.rationale, "claude",
-         datetime.now(timezone.utc).isoformat(), shas[a], shas[b]),
-    )
-    db.commit()
+    relation = args.relation or "conceptually_related_to"
+    append_semantics(root, {
+        "type": "edge", "src": a, "dst": b, "relation": relation,
+        "rationale": args.rationale, "origin": "claude",
+        "created": datetime.now(timezone.utc).isoformat(),
+        "src_sha": shas[a], "dst_sha": shas[b],
+    })
+    sync_semantics(root, db)
     write_map(root, db)
-    print(f"edge saved: {a} ↔ {b} ({args.relation})")
+    print(f"edge saved: {a} ↔ {b} ({relation})")
+
+
+def cmd_edge_repin(root, db, args):
+    src, dst = norm_rel(args.src), norm_rel(args.dst)
+    a, b = sorted([src, dst])
+    rows = db.execute(
+        "SELECT src, dst, relation, rationale, origin, created FROM edges "
+        "WHERE src=? AND dst=?" + (" AND relation=?" if args.relation else ""),
+        (a, b, args.relation) if args.relation else (a, b),
+    ).fetchall()
+    if not rows:
+        sys.exit(f"no edge between {a} and {b} (use edge add to create one)")
+    shas = endpoint_shas(db, a, b)
+    now = datetime.now(timezone.utc).isoformat()
+    for s, d, rel, rat, origin, created in rows:
+        append_semantics(root, {
+            "type": "edge", "src": s, "dst": d, "relation": rel,
+            "rationale": rat, "origin": origin, "created": created,
+            "src_sha": shas[s], "dst_sha": shas[d], "repinned": now,
+        })
+    sync_semantics(root, db)
+    write_map(root, db)
+    print(f"repinned {len(rows)} edge(s): {a} ↔ {b} (rationale kept, shas refreshed)")
+
+
+def prune_semantics(root, db, kind):
+    kept, removed = [], 0
+    for r in compact_semantics(load_semantics(root)):
+        if r["type"] == kind == "note" and not sources_fresh(db, r.get("sources", [])):
+            removed += 1
+            continue
+        if r["type"] == kind == "edge" and not edge_is_fresh(
+            db, r.get("src"), r.get("dst"), r.get("src_sha"), r.get("dst_sha")
+        ):
+            removed += 1
+            continue
+        kept.append(r)
+    write_semantics(root, kept)
+    sync_semantics(root, db)
+    write_map(root, db)
+    return removed
 
 
 def cmd_edges(root, db, args):
     r = fresh_edges(db)
+    pruned = prune_semantics(root, db, "edge") if args.prune and r["stale"] else 0
+    if args.json:
+        recs = [
+            {"src": s, "dst": d, "relation": rel, "rationale": rat, "origin": o, "fresh": True}
+            for s, d, rel, rat, o in r["fresh"]
+        ]
+        if args.all:
+            recs += [
+                {"src": s, "dst": d, "relation": rel, "rationale": rat, "origin": o, "fresh": False}
+                for s, d, rel, rat, o in r["stale"] if not pruned
+            ]
+        print(json.dumps({"edges": recs, "pruned": pruned}, ensure_ascii=False, indent=2))
+        return
     for src, dst, rel, rat, origin in r["fresh"]:
         print(f"[fresh|{origin}] {src} --{rel}→ {dst}\n   {rat[:140]}")
-    if args.all:
+    if args.all and not pruned:
         for src, dst, rel, rat, origin in r["stale"]:
             print(f"[STALE|{origin}] {src} --{rel}→ {dst}")
-    if args.prune and r["stale"]:
-        for src, dst, rel, _, _ in r["stale"]:
-            db.execute("DELETE FROM edges WHERE src=? AND dst=? AND relation=?", (src, dst, rel))
-        db.commit()
-        write_map(root, db)
-        print(f"pruned {len(r['stale'])} stale edges")
+    if pruned:
+        print(f"pruned {pruned} stale edges")
     elif r["stale"] and not args.all:
         print(f"({len(r['stale'])} stale edges hidden — use --all to show, --prune to delete)")
 
@@ -876,17 +1055,22 @@ def cmd_search(root, db, args):
     if not terms:
         sys.exit("empty query")
 
-    shown_notes = 0
+    matched_notes = []
     for q, ins, created, src in db.execute(
         "SELECT question, insight, created, sources FROM notes ORDER BY id DESC"
     ):
         hay = (q + " " + ins).lower()
         if all(t in hay for t in terms) and note_is_fresh(db, src):
-            files = ", ".join(s["path"] for s in json.loads(src))
-            print(f"[NOTE fresh {created[:10]}] Q: {q}\n  {ins}\n  sources: {files}\n")
-            shown_notes += 1
-            if shown_notes >= 3:
+            matched_notes.append(
+                {"question": q, "insight": ins, "created": created,
+                 "sources": [s["path"] for s in json.loads(src)]}
+            )
+            if len(matched_notes) >= 3:
                 break
+    if not args.json:
+        for n in matched_notes:
+            print(f"[NOTE fresh {n['created'][:10]}] Q: {n['question']}\n"
+                  f"  {n['insight']}\n  sources: {', '.join(n['sources'])}\n")
 
     titles = {p: t for p, t in db.execute("SELECT path, title FROM files")}
     paths = candidate_paths(db, terms, titles)
@@ -920,7 +1104,20 @@ def cmd_search(root, db, args):
         results.append((score, path, line, heading, content))
 
     results.sort(key=lambda r: -r[0])
-    if not results and not shown_notes:
+    if args.json:
+        out = []
+        for score, path, line, heading, content in results[: args.n]:
+            lines = content.splitlines()
+            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in terms)]
+            rec = {"path": path, "line": line, "heading": heading,
+                   "score": score, "matched": hits[:3]}
+            if args.full:
+                rec["content"] = content
+            out.append(rec)
+        print(json.dumps({"query": args.query, "notes": matched_notes, "results": out},
+                         ensure_ascii=False, indent=2))
+        return
+    if not results and not matched_notes:
         print("no results")
         return
     for score, path, line, heading, content in results[: args.n]:
@@ -950,6 +1147,10 @@ def cmd_links(root, db, args):
     target = norm_rel(args.target)
     if REQID.fullmatch(target):
         rows = db.execute("SELECT src FROM links WHERE kind='req' AND dst=?", (target,)).fetchall()
+        if args.json:
+            print(json.dumps({"target": target, "kind": "req",
+                              "docs": [src for (src,) in rows]}, ensure_ascii=False, indent=2))
+            return
         print(f"{target} appears in {len(rows)} docs:")
         for (src,) in rows:
             print(f"  {src}")
@@ -962,28 +1163,38 @@ def cmd_links(root, db, args):
     if not path:
         sys.exit(f"not found: {target}")
 
-    print(f"== {path}")
-    print("outlinks:")
+    outlinks = []
     for dst, kind in db.execute("SELECT dst, kind FROM links WHERE src=? ORDER BY kind", (path,)):
         resolved = (resolve_stem(stems, dst) or dst) if kind == "wiki" else dst
-        tag = f"linked|{kind}" if kind in ("wiki", "md") else kind
-        print(f"  [{tag}] {resolved}")
-    print("backlinks:")
-    seen_back = set()
+        outlinks.append({"target": resolved, "kind": kind})
+    backlinks, seen_back = [], set()
     for src, dst, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
         resolved = resolve_stem(stems, dst) if kind == "wiki" else dst
         if resolved == path and src not in seen_back:
             seen_back.add(src)
-            print(f"  [linked|{kind}] {src}")
+            backlinks.append({"source": src, "kind": kind})
     inferred = [
-        e for e in fresh_edges(db)["fresh"] if path in (e[0], e[1])
+        {"other": (dst if src == path else src), "relation": rel,
+         "origin": origin, "rationale": rat}
+        for src, dst, rel, rat, origin in fresh_edges(db)["fresh"] if path in (src, dst)
     ]
+    if args.json:
+        print(json.dumps({"target": path, "outlinks": outlinks, "backlinks": backlinks,
+                          "inferred": inferred}, ensure_ascii=False, indent=2))
+        return
+    print(f"== {path}")
+    print("outlinks:")
+    for l in outlinks:
+        tag = f"linked|{l['kind']}" if l["kind"] in ("wiki", "md") else l["kind"]
+        print(f"  [{tag}] {l['target']}")
+    print("backlinks:")
+    for l in backlinks:
+        print(f"  [linked|{l['kind']}] {l['source']}")
     if inferred:
         print("inferred:")
-        for src, dst, rel, rat, origin in inferred:
-            other = dst if src == path else src
-            print(f"  [inferred|{rel}|{origin}] {other}")
-            print(f"    ∵ {rat[:120]}")
+        for e in inferred:
+            print(f"  [inferred|{e['relation']}|{e['origin']}] {e['other']}")
+            print(f"    ∵ {e['rationale'][:120]}")
 
 
 def cmd_path(root, db, args):
@@ -1002,7 +1213,11 @@ def cmd_path(root, db, args):
     if not dst:
         sys.exit(f"not found: {args.dst}")
     if src == dst:
-        print(src)
+        if args.json:
+            print(json.dumps({"src": src, "dst": dst, "found": True, "hops": 0,
+                              "chain": [{"path": src, "via": None}]}, ensure_ascii=False, indent=2))
+        else:
+            print(src)
         return
 
     adj = {}
@@ -1030,7 +1245,11 @@ def cmd_path(root, db, args):
                 prev[nxt] = cur
                 q.append(nxt)
     if dst not in prev:
-        print(f"no path: {src} ↮ {dst}")
+        if args.json:
+            print(json.dumps({"src": src, "dst": dst, "found": False, "hops": None,
+                              "chain": []}, ensure_ascii=False, indent=2))
+        else:
+            print(f"no path: {src} ↮ {dst}")
         return
     chain = []
     cur = dst
@@ -1038,6 +1257,12 @@ def cmd_path(root, db, args):
         chain.append(cur)
         cur = prev[cur]
     chain.reverse()
+    if args.json:
+        steps = [{"path": chain[0], "via": None}]
+        steps += [{"path": b, "via": adj[a][b]} for a, b in zip(chain, chain[1:])]
+        print(json.dumps({"src": src, "dst": dst, "found": True,
+                          "hops": len(chain) - 1, "chain": steps}, ensure_ascii=False, indent=2))
+        return
     print(chain[0])
     for a, b in zip(chain, chain[1:]):
         print(f"  {adj[a][b]} {b}")
@@ -1052,35 +1277,75 @@ def cmd_note_add(root, db, args):
         if not row:
             sys.exit(f"source not in index (run update first?): {p}")
         sources.append({"path": p, "sha": row[0]})
-    db.execute(
-        "INSERT INTO notes(question, insight, created, sources) VALUES(?,?,?,?)",
-        (args.question, args.insight, datetime.now(timezone.utc).isoformat(), json.dumps(sources)),
-    )
-    db.commit()
+    append_semantics(root, {
+        "type": "note", "question": args.question, "insight": args.insight,
+        "created": datetime.now(timezone.utc).isoformat(), "sources": sources,
+    })
+    sync_semantics(root, db)
     write_map(root, db)
     print(f"note saved ({len(sources)} sources pinned)")
 
 
 def cmd_notes(root, db, args):
     rows = db.execute("SELECT id, question, insight, created, sources FROM notes ORDER BY id DESC").fetchall()
-    stale_ids = []
-    for nid, q, ins, created, src in rows:
-        fresh = note_is_fresh(db, src)
-        if not fresh:
-            stale_ids.append(nid)
-        if fresh or args.all:
-            mark = "fresh" if fresh else "STALE"
-            print(f"#{nid} [{mark}] {created[:10]} Q: {q}\n   {ins}")
-    if args.prune and stale_ids:
-        db.executemany("DELETE FROM notes WHERE id=?", [(i,) for i in stale_ids])
-        db.commit()
-        write_map(root, db)
-        print(f"pruned {len(stale_ids)} stale notes")
-    elif stale_ids and not args.all:
-        print(f"({len(stale_ids)} stale notes hidden — use --all to show, --prune to delete)")
+    recs = [
+        {"id": nid, "question": q, "insight": ins, "created": created,
+         "sources": [s["path"] for s in json.loads(src)], "fresh": note_is_fresh(db, src)}
+        for nid, q, ins, created, src in rows
+    ]
+    n_stale = sum(1 for r in recs if not r["fresh"])
+    pruned = prune_semantics(root, db, "note") if args.prune and n_stale else 0
+    if pruned:
+        recs = [r for r in recs if r["fresh"]]
+    if args.json:
+        shown = recs if args.all else [r for r in recs if r["fresh"]]
+        print(json.dumps({"notes": shown, "pruned": pruned}, ensure_ascii=False, indent=2))
+        return
+    for r in recs:
+        if r["fresh"] or args.all:
+            mark = "fresh" if r["fresh"] else "STALE"
+            print(f"#{r['id']} [{mark}] {r['created'][:10]} Q: {r['question']}\n   {r['insight']}")
+    if pruned:
+        print(f"pruned {pruned} stale notes")
+    elif n_stale and not args.all:
+        print(f"({n_stale} stale notes hidden — use --all to show, --prune to delete)")
+
+
+def install_hook(root: Path):
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        sys.exit(f"not a git repository: {root} — run from inside your vault repo to install the hook")
+    hooks = git_dir / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "post-commit"
+    script = Path(__file__).resolve()
+    line = f'python3 "{script}" --root "{root}" update || true'
+    if hook.exists():
+        text = hook.read_text(encoding="utf-8", errors="replace")
+        if "wikimap" in text:
+            print(f"hook already installed: {hook}")
+            return
+        hook.write_text(  # append — an existing hook is someone's workflow, never replace it
+            text.rstrip("\n") + "\n\n# wikimap: keep the index fresh after every commit\n" + line + "\n",
+            encoding="utf-8",
+        )
+        print(f"appended wikimap update to existing {hook}")
+    else:
+        hook.write_text(
+            "#!/bin/sh\n# wikimap: keep the index fresh after every commit\n" + line + "\n",
+            encoding="utf-8",
+        )
+        print(f"wrote {hook}")
+    try:
+        hook.chmod(hook.stat().st_mode | 0o755)
+    except OSError:
+        pass
 
 
 def cmd_install(args):
+    if args.hook:
+        install_hook(find_root(args.root))
+        return
     base = (Path.cwd() if args.project else Path.home()) / ".claude"
     dest = base / "skills" / "wikimap"
     dest.mkdir(parents=True, exist_ok=True)
@@ -1113,6 +1378,9 @@ def main():
 
     ins = sub.add_parser("install", help="install as a Claude Code skill (~/.claude/skills/wikimap)")
     ins.add_argument("--project", action="store_true", help="install to ./.claude instead of ~/.claude")
+    ins.add_argument("--hook", action="store_true",
+                     help="install a git post-commit hook in the vault repo that runs "
+                          "wikimap update (appends to an existing hook, never replaces)")
 
     up = sub.add_parser("update", help="incremental re-index + regenerate the map file")
     up.add_argument("--ignore", action="append", default=[], metavar="DIR_OR_GLOB",
@@ -1131,13 +1399,16 @@ def main():
     sp.add_argument("-C", type=int, default=0, dest="context",
                     help="show N context lines around each matched line")
     sp.add_argument("--full", action="store_true", help="print the whole matched section")
+    sp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     lp = sub.add_parser("links", help="outlinks/backlinks of a doc, or docs for a REQ-ID")
     lp.add_argument("target")
+    lp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     pp = sub.add_parser("path", help="shortest link path between two docs (BFS over links + fresh edges)")
     pp.add_argument("src")
     pp.add_argument("dst")
+    pp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     np_ = sub.add_parser("note", help="save an answer-time semantic insight")
     np_.add_argument("add", choices=["add"])
@@ -1148,6 +1419,7 @@ def main():
     lsp = sub.add_parser("notes", help="list semantic notes")
     lsp.add_argument("--all", action="store_true")
     lsp.add_argument("--prune", action="store_true")
+    lsp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     ig = sub.add_parser("import-graphify", help="import INFERRED edges from a graphify graph.json")
     ig.add_argument("graph", help="path to graph.json")
@@ -1158,17 +1430,23 @@ def main():
     sg.add_argument("--max-df", type=int, default=4, dest="max_df")
     sg.add_argument("--wikilink", action="store_true",
                     help="print candidates as paste-ready [[wikilinks]] for the doc body")
+    sg.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
-    ea = sub.add_parser("edge", help="confirm an inferred connection (sha-pinned both ends)")
-    ea.add_argument("add", choices=["add"])
+    ea = sub.add_parser("edge", help="confirm or repin an inferred connection (sha-pinned both ends)")
+    ea.add_argument("action", choices=["add", "repin"],
+                    help="add: save a new connection; repin: refresh the shas of an existing "
+                         "one after reviewing both ends (rationale kept)")
     ea.add_argument("--src", required=True)
     ea.add_argument("--dst", required=True)
-    ea.add_argument("--relation", default="conceptually_related_to")
-    ea.add_argument("--rationale", required=True)
+    ea.add_argument("--relation", default=None,
+                    help="add: relation name (default conceptually_related_to); "
+                         "repin: limit to this relation (default: all edges of the pair)")
+    ea.add_argument("--rationale", default=None, help="required for add")
 
     le = sub.add_parser("edges", help="list inferred connections")
     le.add_argument("--all", action="store_true")
     le.add_argument("--prune", action="store_true")
+    le.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     args = ap.parse_args()
     if args.cmd == "install":
@@ -1177,6 +1455,7 @@ def main():
     root = find_root(args.root)
     db = open_db(root)
     try:
+        sync_semantics(root, db)
         if args.cmd == "update":
             cmd_update(root, db, args)
         elif args.cmd == "map":
@@ -1198,7 +1477,10 @@ def main():
         elif args.cmd == "suggest":
             cmd_suggest(root, db, args)
         elif args.cmd == "edge":
-            cmd_edge_add(root, db, args)
+            if args.action == "repin":
+                cmd_edge_repin(root, db, args)
+            else:
+                cmd_edge_add(root, db, args)
         elif args.cmd == "edges":
             cmd_edges(root, db, args)
     finally:

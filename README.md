@@ -33,7 +33,7 @@ The LLM cost is proportional to **what you actually asked**, never to corpus siz
 
 At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time — an FTS5 trigram index kicks in at ≥500 docs), incremental update with 3 changes **0.19 s**, search 60–100 ms via FTS5 (vs ~0.3 s linear fallback). Queries containing terms under 3 characters fall back to the exact linear scan, so CJK short-word recall is never sacrificed for speed.
 
-On an expanded 30-query golden set (Korean/English/mixed, 309-doc vault): **recall@5 30/30, avg 67 ms** (re-verified at 30/30 after HTML indexing landed in 0.5.0). Ranking changes are gated by this kind of golden set in CI — the test suite (`python3 tests.py`, stdlib only) covers incremental sync, ghost-free deletes, byte-identical determinism, FTS consistency at scale, CJK short-term fallback, ignore config, map relocation, HTML tag-strip indexing, and install never touching an existing `SKILL.md`. CI runs it on macOS, Linux, and Windows, Python 3.8 and 3.13.
+On an expanded 30-query golden set (Korean/English/mixed, 309-doc vault): **recall@5 30/30, avg 67 ms** (re-verified at 30/30 after HTML indexing in 0.5.0 and the semantics-file migration in 0.6.0). Ranking changes are gated by this kind of golden set in CI — the test suite (`python3 tests.py`, stdlib only) covers incremental sync, ghost-free deletes, byte-identical determinism, FTS consistency at scale, CJK short-term fallback, ignore config, map relocation, HTML tag-strip indexing, semantics surviving DB deletion, the ≤0.5.x migration path, `--json` schemas, hook append-preservation, and install never touching an existing `SKILL.md`. CI runs it on macOS, Linux, and Windows, Python 3.8 and 3.13.
 
 Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
 
@@ -58,19 +58,26 @@ That's the whole thing. `install --project` writes to `./.claude` for per-repo s
 | `note add` | Save an answer-time insight, pinned to source content hashes |
 | `suggest [--doc path] [--wikilink]` | Heuristic candidates for unwritten connections: shared rare terms, shared requirement IDs, shared code references. 0.2 s, no LLM. `--wikilink` prints paste-ready `[[links]]` — promote real connections into the doc body, where every tool can read them |
 | `edge add` | Confirm a connection (agent judges `suggest` candidates); pinned to both files' hashes |
+| `edge repin --src a --dst b` | An edge went stale because an endpoint was edited, but the connection still holds? Refresh the sha pins and keep the rationale — no retyping |
 | `notes` / `edges` `[--all] [--prune]` | List cached semantics; stale entries are hidden by default and prunable |
 | `import-graphify <graph.json>` | One-time migration of INFERRED edges from an existing graphify graph — with hash freshness retrofitted |
+| `install --hook` | Git post-commit hook that runs `update` after every commit — appends to an existing hook, never replaces it |
+
+`search`, `links`, `path`, `suggest`, `notes`, and `edges` all take **`--json`** — structured output for agents and scripts, no regex-scraping of human output. Schemas are stable and covered by the test suite.
 
 ## How inferred connections work without eager LLM extraction
 
 1. `suggest` proposes candidate pairs from free signals: rare terms shared by only 2–4 documents, shared requirement IDs, references to the same source files. Pairs already linked explicitly are excluded; cross-directory pairs get a boost (more surprising).
 2. Your assistant reads only the top candidates for the doc that changed and confirms the real ones with `edge add`. Cost scales with the edit, not the corpus.
-3. Confirmed edges appear in `links` output and `MAP.md`, and go stale automatically when either endpoint changes.
+3. Confirmed edges appear in `links` output and `MAP.md`, and go stale automatically when either endpoint changes. Stale-because-edited but still valid? `edge repin` re-pins it after review, rationale intact.
 
 ## Outputs
 
 - `MAP.md` — vault root. Directory taxonomy, hub documents, recent changes, cross-document requirement IDs, inferred connections, fresh notes. The agent entry point.
-- `.wikimap/index.db` — SQLite. Disposable; rebuild anytime with `update`.
+- `.wikimap/semantics.jsonl` — the notes and edges themselves, append-only JSON lines. **This file is the source of truth** for the semantic layer: commit it to git to back up and share what your assistant has learned about the vault. Hand-editable; one bad line never takes the layer down.
+- `.wikimap/index.db` — SQLite. A derived cache, genuinely disposable: delete it anytime, `update` rebuilds it from your files plus `semantics.jsonl` with nothing lost.
+
+Upgrading from ≤0.5.x: the first run migrates existing DB notes/edges into `semantics.jsonl` automatically, one-time, nothing to do.
 
 ## Coexisting with other vault tools
 

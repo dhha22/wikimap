@@ -11,19 +11,22 @@ Design: eager structure, lazy semantics.
 Single file, stdlib only.
 """
 import argparse
+import difflib
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
 import time
+import zlib
 from collections import Counter, deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -32,12 +35,13 @@ IGNORE_DIRS = {
 IGNORE_FILES = {"MAP.md", ".wikimapignore"}
 PLAIN_EXTS = {".txt", ".rst", ".org", ".adoc"}
 HTML_EXTS = {".html", ".htm"}
-INDEX_EXTS = {".md"} | PLAIN_EXTS | HTML_EXTS
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+INDEX_EXTS = {".md", ".pdf", ".svg"} | PLAIN_EXTS | HTML_EXTS | IMG_EXTS
 MAP_DISABLED = "-"
 
 SKILL_TEMPLATE = r"""---
 name: wikimap
-description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain-text .txt/.rst/.org/.adoc and HTML indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
+description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain text, HTML, PDF, and images indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
 ---
 
 # wikimap
@@ -50,7 +54,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | Command | Purpose |
 |---------|---------|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
-| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe |
+| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed) |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
@@ -61,6 +65,8 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | `edges [--all] [--prune]` | list inferred connections |
 | `import-graphify <graph.json>` | one-time import of INFERRED edges from an existing graphify graph |
 | `install --hook` | git post-commit hook that runs `update` automatically (appends to an existing hook) |
+| `mv <old> <new> [--apply]` | move/rename a doc AND rewrite every wikilink/md/img reference to it (dry run without `--apply`); semantics.jsonl paths updated too |
+| `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied) |
 
 `search`/`links`/`path`/`suggest`/`notes`/`edges` accept `--json` for structured output — prefer it when a script consumes the result.
 
@@ -80,8 +86,18 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
 WIKILINK = re.compile(r"\[\[([^\]|#]+)")
 MDLINK = re.compile(r"\]\(([^)#\s]+\.md)\)")
+IMGLINK = re.compile(r"!\[([^\]]*)\]\(([^)#\s]+)\)")
 CODEREF = re.compile(r"\b[\w/.-]*\w\.(?:kt|kts|swift|java|py|ts|tsx|gradle)\b")
 REQID = re.compile(r"\bREQ-\d+\b")
+SVG_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
+XML_TAG = re.compile(r"<[^>]*>")
+PDF_STREAM = re.compile(rb"stream\r?\n(.*?)endstream", re.DOTALL)
+PDF_TEXTBLOCK = re.compile(rb"\bBT\b(.*?)\bET\b", re.DOTALL)
+PDF_SHOWTEXT = re.compile(rb"\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|\")")
+PDF_ARRAY = re.compile(rb"\[((?:\\.|[^\\\]])*)\]\s*TJ", re.DOTALL)
+PDF_LITERAL = re.compile(rb"\(((?:\\.|[^\\()])*)\)")
+PDF_TITLE = re.compile(rb"/Title\s*\(((?:\\.|[^\\()])*)\)")
+PDF_WORD = re.compile(r"[A-Za-z0-9]{3,}|[가-힣]{2,}|[぀-ヿ一-鿿]{2,}")
 
 
 def sha256_of(path: Path) -> str:
@@ -126,6 +142,10 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_links_src ON links(src);
         CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS tags(path TEXT, tag TEXT);
+        CREATE INDEX IF NOT EXISTS idx_tags_path ON tags(path);
+        CREATE TABLE IF NOT EXISTS img_alts(src TEXT, dst TEXT, alt TEXT);
+        CREATE INDEX IF NOT EXISTS idx_img_alts_src ON img_alts(src);
         """
     )
     try:
@@ -219,6 +239,7 @@ class _HTMLDoc(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title = ""
         self.hrefs = []
+        self.imgs = []
         self.events = []
         self._skip = 0
         self._in_title = False
@@ -235,6 +256,10 @@ class _HTMLDoc(HTMLParser):
             href = dict(attrs).get("href") or ""
             if href:
                 self.hrefs.append(href)
+        elif tag == "img":
+            a = dict(attrs)
+            if a.get("src"):
+                self.imgs.append((a["src"], a.get("alt") or ""))
         if tag in self.BREAKS:
             self.events.append(("text", "\n"))
 
@@ -288,19 +313,146 @@ def parse_html_doc(rel, text, stem):
     if len(chunks) == 1 and sections:
         sections = parse_plain_sections(rel, sections[0][4].splitlines())
     title = " ".join(doc.title.split()) or first_h1 or stem
-    return title, sections, doc.hrefs
+    return title, sections, doc.hrefs, doc.imgs
+
+
+def parse_frontmatter_tags(raw):
+    return [t.strip().strip("\"'").lower() for t in raw.strip("[]").split(",") if t.strip()]
+
+
+def _pdf_str(raw: bytes) -> str:
+    out, i = bytearray(), 0
+    esc = {ord("n"): 10, ord("r"): 13, ord("t"): 9,
+           ord("("): 40, ord(")"): 41, ord("\\"): 92}
+    while i < len(raw):
+        c = raw[i]
+        if c == 0x5C and i + 1 < len(raw):
+            n = raw[i + 1]
+            if n in esc:
+                out.append(esc[n])
+                i += 2
+            elif 0x30 <= n <= 0x37:
+                j = i + 1
+                while j < len(raw) and j < i + 4 and 0x30 <= raw[j] <= 0x37:
+                    j += 1
+                out.append(int(raw[i + 1 : j], 8) & 0xFF)
+                i = j
+            else:
+                out.append(n)
+                i += 2
+        else:
+            out.append(c)
+            i += 1
+    b = bytes(out)
+    if b[:2] == b"\xfe\xff":
+        return b[2:].decode("utf-16-be", errors="replace")
+    return b.decode("latin-1", errors="replace")
+
+
+def _pdf_wordish(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 2:
+        return False
+    good = sum(1 for ch in s if ch.isalnum() or ch.isspace() or ch in ".,;:!?%()·-–—'\"/&+@")
+    return good / len(s) >= 0.8
+
+
+def extract_pdf_text(data: bytes):
+    """Deterministic literal-string extraction, BT..ET text blocks only — image/CID
+    streams yield nothing wordish, so scanned or CJK-CID PDFs fall back to name-only."""
+    parts = []
+
+    def emit(raw):
+        s = _pdf_str(raw)
+        if _pdf_wordish(s):
+            parts.append(s)
+
+    def harvest(buf):
+        if b"BT" not in buf:
+            return
+        for block in PDF_TEXTBLOCK.finditer(buf):
+            b = block.group(1)
+            for m in PDF_SHOWTEXT.finditer(b):
+                emit(m.group(1))
+                parts.append(" ")
+            for arr in PDF_ARRAY.finditer(b):
+                body = arr.group(1)
+                if b"(" not in body:
+                    continue
+                for lit in PDF_LITERAL.finditer(body):
+                    emit(lit.group(1))
+                parts.append(" ")
+            parts.append("\n")
+
+    for m in PDF_STREAM.finditer(data):
+        buf = m.group(1)
+        try:
+            buf = zlib.decompress(buf)
+        except Exception:
+            pass  # not FlateDecode — treat as an uncompressed content stream
+        harvest(buf)
+
+    text = "".join(ch for ch in "".join(parts) if ch.isprintable() or ch in "\n ")
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    ok = len(PDF_WORD.findall(text)) >= 5
+    title = ""
+    tm = PDF_TITLE.search(data)
+    if tm:
+        title = " ".join(_pdf_str(tm.group(1)).split())
+        if not _pdf_wordish(title):
+            title = ""
+    return text if ok else "", title, ok
+
+
+def stem_words(stem: str) -> str:
+    return " ".join(w for w in re.split(r"[-_.\s]+", stem) if w)
 
 
 def parse_file(root: Path, path: Path):
     rel = path.relative_to(root).as_posix()
+    suffix = path.suffix.lower()
+    stat_mtime = path.stat().st_mtime
+
+    def resolve_doc_link(dst):
+        resolved = (path.parent / dst).resolve()
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            return norm_rel(dst)
+
+    if suffix in IMG_EXTS:
+        data = path.read_bytes()
+        return {
+            "path": rel, "sha": hashlib.sha256(data).hexdigest(), "mtime": stat_mtime,
+            "title": path.stem, "words": 0,
+            "sections": [(rel, 1, 1, "(image)", stem_words(path.stem))],
+            "links": [], "tags": [], "img_alts": [],
+        }
+
+    if suffix == ".pdf":
+        data = path.read_bytes()
+        text, pdf_title, ok = extract_pdf_text(data)
+        if ok:
+            sections = parse_plain_sections(rel, text.splitlines())
+        else:
+            sections = [(rel, 1, 1, "(pdf)", stem_words(path.stem))]
+        links = [(rel, m, "code") for m in set(CODEREF.findall(text))]
+        links += [(rel, m, "req") for m in set(REQID.findall(text))]
+        return {
+            "path": rel, "sha": hashlib.sha256(data).hexdigest(), "mtime": stat_mtime,
+            "title": pdf_title or path.stem, "words": len(text.split()),
+            "sections": sections, "links": links, "tags": [], "img_alts": [],
+            "pdf_name_only": not ok,
+        }
+
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    suffix = path.suffix.lower()
-    html_hrefs = []
+    html_hrefs, html_imgs, tags = [], [], []
 
     if suffix == ".md":
         meta, body_start = parse_frontmatter(lines)
         title = meta.get("title") or ""
+        tags = parse_frontmatter_tags(meta.get("tags", ""))
         sections = []
         cur_heading, cur_level, cur_line, buf = "(intro)", 0, body_start + 1, []
         for i in range(body_start, len(lines)):
@@ -318,27 +470,49 @@ def parse_file(root: Path, path: Path):
             title = path.stem
         scan_text = text
     elif suffix in HTML_EXTS:
-        title, sections, html_hrefs = parse_html_doc(rel, text, path.stem)
+        title, sections, html_hrefs, html_imgs = parse_html_doc(rel, text, path.stem)
         scan_text = "\n".join(s[4] for s in sections)  # tag-stripped — raw HTML would false-match refs
+    elif suffix == ".svg":
+        stripped = XML_TAG.sub(" ", text)
+        tm = SVG_TITLE.search(text)
+        title = " ".join(tm.group(1).split()) if tm and tm.group(1).strip() else path.stem
+        sections = parse_plain_sections(rel, stripped.splitlines()) or [
+            (rel, 1, 1, "(svg)", stem_words(path.stem))
+        ]
+        scan_text = stripped
     else:
         sections = parse_plain_sections(rel, lines)
         title = next((l.strip()[:80] for l in lines if l.strip()), path.stem)
         scan_text = text
 
-    def resolve_doc_link(dst):
-        resolved = (path.parent / dst).resolve()
-        try:
-            return resolved.relative_to(root).as_posix()
-        except ValueError:
-            return norm_rel(dst)
-
-    links = []
+    links, img_alts = [], []
     for m in WIKILINK.finditer(scan_text):
         links.append((rel, m.group(1).strip(), "wiki"))
     for m in MDLINK.finditer(text):
         dst = m.group(1)
         if not dst.startswith("http"):
             links.append((rel, resolve_doc_link(dst), "md"))
+    if suffix == ".md":
+        for m in IMGLINK.finditer(text):
+            alt, dst = m.group(1), m.group(2)
+            if dst.startswith(("http://", "https://", "//")):
+                continue
+            if Path(dst).suffix.lower() not in IMG_EXTS | {".svg"}:
+                continue
+            resolved = resolve_doc_link(dst)
+            links.append((rel, resolved, "img"))
+            if alt.strip():
+                img_alts.append((rel, resolved, alt.strip()))
+    for src_attr, alt in html_imgs:
+        src_attr = src_attr.split("#")[0].split("?")[0]
+        if not src_attr or src_attr.startswith(("http://", "https://", "//", "data:")):
+            continue
+        if Path(src_attr).suffix.lower() not in IMG_EXTS | {".svg"}:
+            continue
+        resolved = resolve_doc_link(src_attr)
+        links.append((rel, resolved, "img"))
+        if alt.strip():
+            img_alts.append((rel, resolved, alt.strip()))
     for href in html_hrefs:
         href = href.split("#")[0].split("?")[0]
         if not href or href.startswith(("http://", "https://", "mailto:", "//")):
@@ -354,11 +528,13 @@ def parse_file(root: Path, path: Path):
     return {
         "path": rel,
         "sha": hashlib.sha256(text.encode()).hexdigest(),
-        "mtime": path.stat().st_mtime,
+        "mtime": stat_mtime,
         "title": title,
         "words": len(text.split()),
         "sections": sections,
         "links": links,
+        "tags": tags,
+        "img_alts": img_alts,
     }
 
 
@@ -820,6 +996,28 @@ def apply_map_flags(root, db, args):
             pass
 
 
+def rebuild_image_sections(db):
+    """Image search text = filename + every alt text that references it — alts live in
+    other docs, so this runs vault-wide each update instead of per-file (images are few)."""
+    alts = {}
+    for dst, alt in db.execute("SELECT dst, alt FROM img_alts ORDER BY dst, alt"):
+        alts.setdefault(dst, []).append(alt)
+    changed = []
+    for (p,) in db.execute("SELECT path FROM files").fetchall():
+        if Path(p).suffix.lower() not in IMG_EXTS:
+            continue
+        content = " ".join(
+            [Path(p).stem, stem_words(Path(p).stem)] + sorted(set(alts.get(p, [])))
+        )
+        row = db.execute("SELECT content FROM sections WHERE path=?", (p,)).fetchone()
+        if row and row[0] == content:
+            continue
+        db.execute("DELETE FROM sections WHERE path=?", (p,))
+        db.execute("INSERT INTO sections VALUES(?,?,?,?,?)", (p, 1, 1, "(image)", content))
+        changed.append(p)
+    return changed
+
+
 def cmd_update(root, db, args):
     t0 = time.time()
     apply_map_flags(root, db, args)
@@ -828,6 +1026,8 @@ def cmd_update(root, db, args):
     skip_rels = frozenset({map_rel} if map_rel != MAP_DISABLED else ())
     skipped = Counter()
     seen, changed_rels = set(), []
+    row = db.execute("SELECT value FROM meta WHERE key='pdf_name_only'").fetchone()
+    pdf_no = set(json.loads(row[0])) if row else set()
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
     for p in scan_files(root, skipped, patterns, skip_rels):
         rel = p.relative_to(root).as_posix()
@@ -841,12 +1041,19 @@ def cmd_update(root, db, args):
             continue
         db.execute("DELETE FROM sections WHERE path=?", (rel,))
         db.execute("DELETE FROM links WHERE src=?", (rel,))
+        db.execute("DELETE FROM tags WHERE path=?", (rel,))
+        db.execute("DELETE FROM img_alts WHERE src=?", (rel,))
         db.execute(
             "INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",
             (rel, parsed["sha"], parsed["mtime"], parsed["title"], parsed["words"]),
         )
         db.executemany("INSERT INTO sections VALUES(?,?,?,?,?)", parsed["sections"])
         db.executemany("INSERT INTO links VALUES(?,?,?)", parsed["links"])
+        db.executemany("INSERT INTO tags VALUES(?,?)",
+                       [(rel, t) for t in parsed.get("tags", [])])
+        db.executemany("INSERT INTO img_alts VALUES(?,?,?)", parsed.get("img_alts", []))
+        if rel.lower().endswith(".pdf"):
+            pdf_no.add(rel) if parsed.get("pdf_name_only") else pdf_no.discard(rel)
         changed_rels.append(rel)
 
     deleted = set(known) - seen
@@ -854,7 +1061,13 @@ def cmd_update(root, db, args):
         db.execute("DELETE FROM files WHERE path=?", (rel,))
         db.execute("DELETE FROM sections WHERE path=?", (rel,))
         db.execute("DELETE FROM links WHERE src=?", (rel,))
-    sync_fts(db, changed_rels, deleted)
+        db.execute("DELETE FROM tags WHERE path=?", (rel,))
+        db.execute("DELETE FROM img_alts WHERE src=?", (rel,))
+        pdf_no.discard(rel)
+    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('pdf_name_only', ?)",
+               (json.dumps(sorted(pdf_no)),))
+    img_changed = rebuild_image_sections(db)
+    sync_fts(db, changed_rels + [p for p in img_changed if p not in deleted], deleted)
     db.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('skipped', ?)",
         (json.dumps(dict(skipped.most_common())),),
@@ -879,6 +1092,7 @@ def cmd_update(root, db, args):
         f"wikimap: {total} files indexed ({len(changed_rels)} changed, {len(deleted)} deleted) "
         f"in {ms}ms | skipped {n_skipped} non-indexed files"
         + (f" ({top})" if top else "")
+        + (f" | pdf text-extraction failed: {len(pdf_no)} (indexed name+path only)" if pdf_no else "")
         + f" | notes: {fresh} fresh, {stale} stale | "
         f"edges: {len(e['fresh'])} fresh, {len(e['stale'])} stale | {map_note}"
     )
@@ -899,7 +1113,7 @@ def vault_health(db):
     known = {p for (p,) in db.execute("SELECT path FROM files")}
     connected, broken, broken_seen = set(), [], set()
     for src, dst, kind in db.execute(
-        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"
+        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md','img')"
     ):
         target = resolve_stem(stems, dst) if kind == "wiki" else (dst if dst in known else None)
         if target and target != src:
@@ -972,6 +1186,13 @@ def write_map(root, db):
     recent = db.execute("SELECT path, title FROM files ORDER BY mtime DESC LIMIT 10").fetchall()
     out += ["", "## Recently changed", ""]
     out += [f"- [{t}]({p})" for p, t in recent]
+
+    tag_rows = db.execute(
+        "SELECT tag, COUNT(*) c FROM tags GROUP BY tag ORDER BY c DESC, tag LIMIT 15"
+    ).fetchall()
+    if tag_rows:
+        out += ["", "## Tags", ""]
+        out += [f"- `{t}` ({c}) — `wikimap search \"tag:{t}\"`" for t, c in tag_rows]
 
     req_rows = db.execute(
         "SELECT dst, COUNT(DISTINCT src) c FROM links WHERE kind='req' "
@@ -1050,17 +1271,32 @@ def candidate_paths(db, terms, titles):
     return paths
 
 
+QUERY_TOKEN = re.compile(r'(?:(title|path|heading|tag):)?(?:"([^"]+)"|([^\s"]+))')
+FIELD_WEIGHT = {"title": 8, "path": 6, "heading": 5, "tag": 7}
+
+
+def parse_query(q):
+    terms = []
+    for m in QUERY_TOKEN.finditer(q):
+        field, phrase, word = m.group(1), m.group(2), m.group(3)
+        term = (phrase if phrase is not None else word or "").lower().strip()
+        if term:
+            terms.append((field, term))
+    return terms
+
+
 def cmd_search(root, db, args):
-    terms = [t.lower() for t in args.query.split() if t.strip()]
+    terms = parse_query(args.query)
     if not terms:
         sys.exit("empty query")
+    plain = [t for f, t in terms if f is None]
 
     matched_notes = []
     for q, ins, created, src in db.execute(
         "SELECT question, insight, created, sources FROM notes ORDER BY id DESC"
     ):
         hay = (q + " " + ins).lower()
-        if all(t in hay for t in terms) and note_is_fresh(db, src):
+        if plain and all(t in hay for t in plain) and note_is_fresh(db, src):
             matched_notes.append(
                 {"question": q, "insight": ins, "created": created,
                  "sources": [s["path"] for s in json.loads(src)]}
@@ -1073,7 +1309,11 @@ def cmd_search(root, db, args):
                   f"  {n['insight']}\n  sources: {', '.join(n['sources'])}\n")
 
     titles = {p: t for p, t in db.execute("SELECT path, title FROM files")}
-    paths = candidate_paths(db, terms, titles)
+    doc_tags = {}
+    for p, t in db.execute("SELECT path, tag FROM tags"):
+        doc_tags.setdefault(p, set()).add(t)
+    fts_terms = [t for f, t in terms if f in (None, "heading")]
+    paths = candidate_paths(db, fts_terms, titles) if fts_terms else None
     if paths is None:
         rows = db.execute("SELECT path, line, heading, content FROM sections")
     elif not paths:
@@ -1093,22 +1333,37 @@ def cmd_search(root, db, args):
     for path, line, heading, content in rows:
         title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
         path_l = path.lower()
-        if not all(t in title_l or t in path_l or t in heading_l or t in content_l for t in terms):
-            continue
-        score = 0
-        for t in terms:
-            score += (
-                8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
-                + min(content_l.count(t), 5)
-            )
-        results.append((score, path, line, heading, content))
+        score, ok = 0, True
+        for f, t in terms:
+            if f == "title":
+                hit = t in title_l
+            elif f == "path":
+                hit = t in path_l
+            elif f == "heading":
+                hit = t in heading_l
+            elif f == "tag":
+                hit = any(t in tag for tag in doc_tags.get(path, ()))
+            else:
+                hit = t in title_l or t in path_l or t in heading_l or t in content_l
+            if not hit:
+                ok = False
+                break
+            if f is None:
+                score += (
+                    8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
+                    + min(content_l.count(t), 5)
+                )
+            else:
+                score += FIELD_WEIGHT[f]
+        if ok:
+            results.append((score, path, line, heading, content))
 
     results.sort(key=lambda r: -r[0])
     if args.json:
         out = []
         for score, path, line, heading, content in results[: args.n]:
             lines = content.splitlines()
-            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in terms)]
+            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in plain)]
             rec = {"path": path, "line": line, "heading": heading,
                    "score": score, "matched": hits[:3]}
             if args.full:
@@ -1127,7 +1382,7 @@ def cmd_search(root, db, args):
             for ln in lines:
                 print(f"  {ln.rstrip()}")
             continue
-        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in terms)]
+        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in plain)]
         if args.context:
             shown = set()
             for i in hits:
@@ -1168,7 +1423,9 @@ def cmd_links(root, db, args):
         resolved = (resolve_stem(stems, dst) or dst) if kind == "wiki" else dst
         outlinks.append({"target": resolved, "kind": kind})
     backlinks, seen_back = [], set()
-    for src, dst, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
+    for src, dst, kind in db.execute(
+        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md','img')"
+    ):
         resolved = resolve_stem(stems, dst) if kind == "wiki" else dst
         if resolved == path and src not in seen_back:
             seen_back.add(src)
@@ -1185,7 +1442,7 @@ def cmd_links(root, db, args):
     print(f"== {path}")
     print("outlinks:")
     for l in outlinks:
-        tag = f"linked|{l['kind']}" if l["kind"] in ("wiki", "md") else l["kind"]
+        tag = f"linked|{l['kind']}" if l["kind"] in ("wiki", "md", "img") else l["kind"]
         print(f"  [{tag}] {l['target']}")
     print("backlinks:")
     for l in backlinks:
@@ -1225,7 +1482,9 @@ def cmd_path(root, db, args):
     def add(a, b, label):
         adj.setdefault(a, {}).setdefault(b, label)
 
-    for s, d, kind in db.execute("SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md')"):
+    for s, d, kind in db.execute(
+        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md','img')"
+    ):
         t = resolve_stem(stems, d) if kind == "wiki" else d
         if t and t != s and t in known:
             add(s, t, f"—[{kind}]→")
@@ -1309,6 +1568,154 @@ def cmd_notes(root, db, args):
         print(f"pruned {pruned} stale notes")
     elif n_stale and not args.all:
         print(f"({n_stale} stale notes hidden — use --all to show, --prune to delete)")
+
+
+MDURL = re.compile(r"\]\(([^)#\s]+)\)")
+
+
+def cmd_mv(root, db, args):
+    old, new = norm_rel(args.old), norm_rel(args.new)
+    old_abs, new_abs = root / old, root / new
+    if not old_abs.is_file():
+        sys.exit(f"not found: {old}")
+    if new_abs.exists():
+        sys.exit(f"destination exists: {new}")
+    known = {p for (p,) in db.execute("SELECT path FROM files")}
+    if old not in known:
+        sys.exit(f"not in index (run update first?): {old}")
+    stems = stem_map(db)
+    old_stem, new_stem = Path(old).stem, Path(new).stem
+    new_no_ext = new[: -len(Path(new).suffix)] if Path(new).suffix else new
+
+    def resolve_from(src_rel, url):
+        resolved = ((root / src_rel).parent / url).resolve()
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            return norm_rel(url)
+
+    ref_srcs = set()
+    for src, dst, kind in db.execute(
+        "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md','img')"
+    ):
+        target = resolve_stem(stems, dst) if kind == "wiki" else dst
+        if target == old and src != old:
+            ref_srcs.add(src)
+
+    edits = []
+    for src in sorted(ref_srcs):
+        p = root / src
+        if not p.is_file() or p.suffix.lower() not in {".md"} | PLAIN_EXTS:
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        n = [0]
+
+        def wiki_sub(m):
+            target = m.group(1).strip()
+            if resolve_stem(stems, target) == old:
+                repl = new_no_ext if "/" in target else new_stem
+                if repl != target:
+                    n[0] += 1
+                    return "[[" + repl
+            return m.group(0)
+
+        def url_sub(m):
+            url = m.group(1)
+            if url.startswith(("http://", "https://", "mailto:", "//")):
+                return m.group(0)
+            if resolve_from(src, url) == old:
+                n[0] += 1
+                return "](" + norm_rel(os.path.relpath(str(root / new), str(p.parent))) + ")"
+            return m.group(0)
+
+        new_text = MDURL.sub(url_sub, WIKILINK.sub(wiki_sub, text))
+        if n[0]:
+            edits.append((src, new_text, n[0]))
+
+    moved_text = None
+    own_n = [0]
+    if old_abs.suffix.lower() in {".md"} | PLAIN_EXTS:
+        text = old_abs.read_text(encoding="utf-8", errors="replace")
+
+        def own_sub(m):
+            url = m.group(1)
+            if url.startswith(("http://", "https://", "mailto:", "//")):
+                return m.group(0)
+            target = resolve_from(old, url)
+            if (root / target).exists():
+                new_url = norm_rel(os.path.relpath(str(root / target), str(new_abs.parent)))
+                if new_url != url:
+                    own_n[0] += 1
+                    return "](" + new_url + ")"
+            return m.group(0)
+
+        rewritten = MDURL.sub(own_sub, text)
+        if own_n[0]:
+            moved_text = rewritten
+
+    sem = load_semantics(root)
+    sem_changed = 0
+    for r in sem:
+        if r["type"] == "note":
+            for s in r.get("sources", []):
+                if s.get("path") == old:
+                    s["path"] = new
+                    sem_changed += 1
+        elif old in (r.get("src"), r.get("dst")):
+            if r["src"] == old:
+                r["src"] = new
+            if r["dst"] == old:
+                r["dst"] = new
+            if r["src"] > r["dst"]:  # edge pairs are stored sorted — keep the invariant
+                r["src"], r["dst"] = r["dst"], r["src"]
+                r["src_sha"], r["dst_sha"] = r.get("dst_sha"), r.get("src_sha")
+            sem_changed += 1
+
+    print(f"mv {old} → {new}")
+    for src, _, n in edits:
+        print(f"  rewrite {n} reference(s) in {src}")
+    if own_n[0]:
+        print(f"  rewrite {own_n[0]} relative link(s) inside the moved file")
+    if sem_changed:
+        print(f"  update {sem_changed} semantic record(s) in semantics.jsonl (shas stay valid)")
+    if not args.apply:
+        print("dry run — nothing written. Re-run with --apply to execute.")
+        return
+    for src, new_text, _ in edits:
+        (root / src).write_text(new_text, encoding="utf-8")
+    new_abs.parent.mkdir(parents=True, exist_ok=True)
+    old_abs.rename(new_abs)
+    if moved_text is not None:
+        new_abs.write_text(moved_text, encoding="utf-8")
+    if sem_changed:
+        write_semantics(root, sem)
+    sync_semantics(root, db)
+    cmd_update(root, db, argparse.Namespace(ignore=[], map_path=None, no_map=False))
+
+
+def cmd_fix_links(root, db, args):
+    stems = stem_map(db)
+    items = []
+    for label, src in vault_health(db)["broken"]:
+        raw = label[2:-2] if label.startswith("[[") else label
+        cands = difflib.get_close_matches(
+            Path(raw).stem.lower(), sorted(stems.keys()), n=3, cutoff=0.6
+        )
+        items.append({"link": label, "in": src, "candidates": [stems[c] for c in cands]})
+    if args.json:
+        print(json.dumps({"broken": items}, ensure_ascii=False, indent=2))
+        return
+    if not items:
+        print("no broken links")
+        return
+    for it in items:
+        print(f"{it['link']}  (in {it['in']})")
+        for c in it["candidates"]:
+            print(f"   → {c}")
+        if not it["candidates"]:
+            print("   → no candidate")
+    print(f"\n{len(items)} broken link(s). Suggestions only — fix by editing the doc, or use "
+          "`wikimap mv` next time you relocate a file.")
 
 
 def install_hook(root: Path):
@@ -1405,6 +1812,15 @@ def main():
     lp.add_argument("target")
     lp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
+    mv = sub.add_parser("mv", help="move/rename a doc and rewrite every reference to it "
+                                   "(dry run by default)")
+    mv.add_argument("old", help="current vault-relative path")
+    mv.add_argument("new", help="new vault-relative path")
+    mv.add_argument("--apply", action="store_true", help="actually write (default: dry run)")
+
+    fl = sub.add_parser("fix-links", help="suggest targets for broken links (suggestions only)")
+    fl.add_argument("--json", action="store_true", help="structured output for agents/scripts")
+
     pp = sub.add_parser("path", help="shortest link path between two docs (BFS over links + fresh edges)")
     pp.add_argument("src")
     pp.add_argument("dst")
@@ -1468,6 +1884,10 @@ def main():
             cmd_links(root, db, args)
         elif args.cmd == "path":
             cmd_path(root, db, args)
+        elif args.cmd == "mv":
+            cmd_mv(root, db, args)
+        elif args.cmd == "fix-links":
+            cmd_fix_links(root, db, args)
         elif args.cmd == "note":
             cmd_note_add(root, db, args)
         elif args.cmd == "notes":

@@ -77,12 +77,13 @@ class VaultTest(unittest.TestCase):
 
 class TestUpdateAndCoverage(VaultTest):
     def test_counts_and_coverage(self):
+        write(self.root, "assets/notes.xyz", "unknown extension stays skipped")
         out = run(self.root, "update")
-        self.assertIn("4 files indexed", out)
+        self.assertIn("5 files indexed", out)
         self.assertIn("skipped 1 non-indexed files", out)
-        self.assertIn(".png 1", out)
+        self.assertIn(".xyz 1", out)
         map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
-        self.assertIn("coverage: every file accounted for — 4 indexed, 1 skipped", map_md)
+        self.assertIn("coverage: every file accounted for — 5 indexed, 1 skipped", map_md)
 
     def test_incremental_and_ghost_free_delete(self):
         run(self.root, "update")
@@ -161,7 +162,7 @@ class TestHealth(VaultTest):
         run(self.root, "update")
         map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
         self.assertIn("## Health", map_md)
-        self.assertIn("orphan docs (no links in or out): 2", map_md)
+        self.assertIn("orphan docs (no links in or out): 3", map_md)
         self.assertIn("`notes/orphan-note.md`", map_md)
         self.assertIn("broken links (target missing): 2", map_md)
         self.assertIn("`[[ghost-doc]]` in specs/auth-spec.md", map_md)
@@ -171,7 +172,7 @@ class TestHealth(VaultTest):
         run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
             "--dst", "specs/auth-spec.md", "--rationale", "test edge")
         map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
-        self.assertIn("orphan docs (no links in or out): 1", map_md)
+        self.assertIn("orphan docs (no links in or out): 2", map_md)
         write(self.root, "notes/orphan-note.md", "# 고립 문서\n\n내용 변경으로 sha 불일치.")
         run(self.root, "update")
         map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
@@ -240,7 +241,7 @@ class TestIgnoreConfig(VaultTest):
         write(self.root, ".synapse/cortex.json.md", "# marker\n\nzxqmarkerfile")
         write(self.root, ".wikimapignore", "# comment line\ndrafts\n.synapse/\n")
         out = run(self.root, "update")
-        self.assertIn("4 files indexed", out)
+        self.assertIn("5 files indexed", out)
         self.assertIn("no results", run(self.root, "search", "zxqdraftmarker"))
         self.assertIn("no results", run(self.root, "search", "zxqmarkerfile"))
 
@@ -273,7 +274,7 @@ class TestMapPlacement(VaultTest):
     def test_custom_map_not_indexed(self):
         run(self.root, "update", "--map-path", "docs/vault-map.md")
         out = run(self.root, "update")
-        self.assertIn("4 files indexed", out)
+        self.assertIn("5 files indexed", out)
         self.assertIn("no results", run(self.root, "search", "auto-generated"))
 
     def test_no_map(self):
@@ -314,7 +315,7 @@ class TestHtmlIndexing(VaultTest):
 
     def test_indexed_and_searchable(self):
         out = run(self.root, "update")
-        self.assertIn("6 files indexed", out)
+        self.assertIn("7 files indexed", out)
         self.assertNotIn(".html", out.split("|")[1], "html must not appear in the skipped list")
         hit = run(self.root, "search", "zxqhtmlneedle")
         self.assertIn("reports/quarterly.html", hit)
@@ -454,6 +455,137 @@ class TestJsonOutput(VaultTest):
         self.assertEqual(json.loads(run(self.root, "notes", "--json"))["notes"][0]["question"], "q")
         self.assertEqual(json.loads(run(self.root, "edges", "--json"))["edges"][0]["rationale"], "r")
         self.assertIn("candidates", json.loads(run(self.root, "suggest", "--json")))
+
+
+class TestQueryLanguage(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "specs/tagged-spec.md", "\n".join([
+            "---", "title: 결제 스펙", "tags: [payment, android]", "---",
+            "# 결제 스펙", "", "환불은 30일 이내. 세션 문구가 여기도 있지만 만료 얘기는 아님.",
+        ]))
+        run(self.root, "update")
+
+    def test_phrase_vs_scattered_words(self):
+        self.assertIn("auth-spec.md", run(self.root, "search", '"세션 만료"'))
+        out = run(self.root, "search", '"만료는 세션"')
+        self.assertIn("no results", out)
+
+    def test_field_prefixes(self):
+        out = run(self.root, "search", "title:결제")
+        self.assertIn("tagged-spec.md", out)
+        self.assertNotIn("orphan-note", out, "결제 in body must not match title: filter")
+        out = run(self.root, "search", "path:plans REQ-01")
+        headers = [l for l in out.splitlines() if not l.startswith(" ")]
+        self.assertTrue(any("auth-plan.md" in h for h in headers))
+        self.assertFalse(any("auth-spec.md" in h for h in headers))
+        out = run(self.root, "search", "heading:로그인")
+        self.assertIn("auth-spec.md", out)
+
+    def test_tag_filter_and_map_summary(self):
+        out = run(self.root, "search", "tag:payment")
+        self.assertIn("tagged-spec.md", out)
+        self.assertIn("no results", run(self.root, "search", "tag:ios"))
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertIn("## Tags", map_md)
+        self.assertIn("`payment` (1)", map_md)
+
+
+PDF_WITH_TEXT = (
+    b"%PDF-1.1\n1 0 obj\n<< /Length 80 >>\nstream\n"
+    b"BT /F1 12 Tf (zxqpdfneedle quarterly payment summary REQ-77 rollout) Tj ET\n"
+    b"endstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+)
+PDF_SCANNED = b"%PDF-1.4\n\x89\x50\x4e\x47\x00\x01\x02binary scan blob no text operators\n%%EOF\n"
+
+
+class TestPdfIndexing(VaultTest):
+    def test_text_pdf_searchable_and_req_extracted(self):
+        (self.root / "reports").mkdir()
+        (self.root / "reports/quarterly-report.pdf").write_bytes(PDF_WITH_TEXT)
+        out = run(self.root, "update")
+        self.assertIn("6 files indexed", out)
+        self.assertNotIn("text-extraction failed", out)
+        self.assertIn("reports/quarterly-report.pdf", run(self.root, "search", "zxqpdfneedle"))
+        self.assertIn("reports/quarterly-report.pdf", run(self.root, "links", "REQ-77"))
+
+    def test_scanned_pdf_name_only_and_honest_coverage(self):
+        (self.root / "scans").mkdir()
+        (self.root / "scans/계약서-2026-스캔본.pdf").write_bytes(PDF_SCANNED)
+        out = run(self.root, "update")
+        self.assertIn("pdf text-extraction failed: 1 (indexed name+path only)", out)
+        self.assertIn("계약서-2026-스캔본.pdf", run(self.root, "search", "계약서"))
+        self.assertIn("no results", run(self.root, "search", "binary scan blob"),
+                      "binary noise must never leak into the index")
+
+
+class TestImageIndexing(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "assets/checkout-flow-v2.png", "fake png bytes")
+        write(self.root, "docs/checkout.md", "\n".join([
+            "# 결제 문서", "",
+            "플로우는 ![결제 승인 전체 플로우 다이어그램](../assets/checkout-flow-v2.png) 참고.",
+        ]))
+        write(self.root, "assets/arch.svg",
+              "<svg xmlns='http://www.w3.org/2000/svg'><title>모듈 아키텍처 zxqsvgtitle</title>"
+              "<text>presentation domain data</text></svg>")
+        run(self.root, "update")
+
+    def test_filename_and_alt_searchable(self):
+        self.assertIn("assets/checkout-flow-v2.png", run(self.root, "search", "checkout flow"))
+        self.assertIn("assets/checkout-flow-v2.png", run(self.root, "search", "승인 전체 플로우"))
+
+    def test_img_link_joins_graph(self):
+        out = run(self.root, "links", "assets/checkout-flow-v2.png")
+        self.assertIn("[linked|img] docs/checkout.md", out)
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertNotIn("`assets/checkout-flow-v2.png`", map_md.split("## Health")[1],
+                         "referenced image must not be an orphan")
+
+    def test_svg_title_indexed(self):
+        self.assertIn("assets/arch.svg", run(self.root, "search", "zxqsvgtitle"))
+
+    def test_alt_updates_when_doc_changes(self):
+        write(self.root, "docs/checkout.md",
+              "# 결제 문서\n\n![환불 예외 처리 흐름](../assets/checkout-flow-v2.png)")
+        run(self.root, "update")
+        self.assertIn("assets/checkout-flow-v2.png", run(self.root, "search", "환불 예외 처리"))
+        self.assertIn("no results", run(self.root, "search", "승인 전체 플로우"))
+
+
+class TestMvAndFixLinks(VaultTest):
+    def test_mv_dry_run_writes_nothing(self):
+        run(self.root, "update")
+        out = run(self.root, "mv", "specs/auth-spec.md", "archive/auth-spec.md")
+        self.assertIn("dry run", out)
+        self.assertTrue((self.root / "specs/auth-spec.md").exists())
+
+    def test_mv_apply_rewrites_references_and_semantics(self):
+        run(self.root, "update")
+        run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
+            "--dst", "specs/auth-spec.md", "--rationale", "moves with the file")
+        run(self.root, "mv", "specs/auth-spec.md", "archive/auth-spec-v2.md", "--apply")
+        self.assertFalse((self.root / "specs/auth-spec.md").exists())
+        plan = (self.root / "plans/auth-plan.md").read_text(encoding="utf-8")
+        self.assertIn("[spec](../archive/auth-spec-v2.md)", plan)
+        self.assertIn("[[archive/auth-spec-v2]]", plan)
+        moved = (self.root / "archive/auth-spec-v2.md").read_text(encoding="utf-8")
+        self.assertIn("[[auth-plan]]", moved)
+        out = run(self.root, "edges")
+        self.assertIn("archive/auth-spec-v2.md", out)
+        self.assertIn("[fresh|claude]", out, "content unchanged — shas must stay valid")
+        self.assertIn("(1 hops)", run(self.root, "path", "auth-spec-v2", "auth-plan"))
+
+    def test_fix_links_suggests_close_match(self):
+        write(self.root, "notes/typo.md", "# typo\n\nsee [[auth-spce]] for details")
+        run(self.root, "update")
+        out = run(self.root, "fix-links")
+        self.assertIn("[[auth-spce]]", out)
+        self.assertIn("specs/auth-spec.md", out)
+        data = json.loads(run(self.root, "fix-links", "--json"))
+        broken = [b for b in data["broken"] if b["link"] == "[[auth-spce]]"]
+        self.assertEqual(broken[0]["candidates"][0], "specs/auth-spec.md")
 
 
 class TestInstallHook(VaultTest):

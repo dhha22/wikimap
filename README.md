@@ -40,12 +40,18 @@ Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with y
 ## Install
 
 ```bash
-curl -O https://raw.githubusercontent.com/dhha22/wikimap/main/wikimap.py
-python3 wikimap.py install          # → ~/.claude/skills/wikimap/ (Claude Code)
-cd your-vault && python3 ~/.claude/skills/wikimap/wikimap.py update
+pipx install wikimap                # or: uv tool install wikimap / pip install wikimap
+cd your-vault && wikimap update
 ```
 
-That's the whole thing. `install --project` writes to `./.claude` for per-repo setup. Existing `SKILL.md` customizations are never overwritten. Requires Python 3.8+, nothing else.
+Or copy the single file — same thing, works offline and without pip:
+
+```bash
+curl -O https://raw.githubusercontent.com/dhha22/wikimap/main/wikimap.py
+cd your-vault && python3 wikimap.py update
+```
+
+Either way, `wikimap install` (or `python3 wikimap.py install`) sets it up as a Claude Code skill at `~/.claude/skills/wikimap/`; `install --project` writes to `./.claude` for per-repo setup. Existing `SKILL.md` customizations are never overwritten. Requires Python 3.8+, nothing else.
 
 ## Commands
 

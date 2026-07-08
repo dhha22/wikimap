@@ -1,3 +1,6 @@
 __pycache__/
 .wikimap/
 MAP.md
+dist/
+build/
+*.egg-info/

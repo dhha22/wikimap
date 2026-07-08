@@ -676,6 +676,27 @@ class TestInstallPreservesSkill(unittest.TestCase):
         skill = tmp / ".claude" / "skills" / "wikimap" / "SKILL.md"
         self.assertIn("name: wikimap", skill.read_text(encoding="utf-8"))
 
+    def test_install_from_console_script_like_pipx(self):
+        # a pipx/uv install runs `import wikimap; wikimap.main()` with the module
+        # living in a venv's site-packages — install must still copy itself and
+        # write SKILL.md to the user's ~/.claude, not somewhere venv-relative
+        tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        site = tmp / "venv" / "lib" / "site-packages"
+        site.mkdir(parents=True)
+        shutil.copy(WIKIMAP, site / "wikimap.py")
+        env = dict(os.environ, HOME=str(tmp), USERPROFILE=str(tmp), PYTHONPATH=str(site))
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, wikimap; sys.argv = ['wikimap', 'install']; wikimap.main()"],
+            capture_output=True, text=True, encoding="utf-8", env=env, cwd=str(tmp),
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dest = tmp / ".claude" / "skills" / "wikimap"
+        self.assertIn("name: wikimap", (dest / "SKILL.md").read_text(encoding="utf-8"))
+        copied = (dest / "wikimap.py").read_text(encoding="utf-8")
+        self.assertEqual(copied, (site / "wikimap.py").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

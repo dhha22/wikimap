@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",

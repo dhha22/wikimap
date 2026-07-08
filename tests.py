@@ -490,6 +490,39 @@ class TestQueryLanguage(VaultTest):
         self.assertIn("## Tags", map_md)
         self.assertIn("`payment` (1)", map_md)
 
+    def test_type_filter(self):
+        self.assertIn("assets/logo.png", run(self.root, "search", "type:image logo"))
+        self.assertIn("auth-spec.md", run(self.root, "search", "세션 type:md"))
+        self.assertIn("no results", run(self.root, "search", "세션 type:text"))
+        self.assertIn("notes/readme.txt", run(self.root, "search", "billing type:text"))
+        with self.assertRaises(AssertionError):
+            run(self.root, "search", "type:docx foo")
+
+    def test_partial_fallback_on_zero_and_results(self):
+        out = run(self.root, "search", "세션 만료 스크린샷")
+        self.assertIn("auth-spec.md", out)
+        self.assertIn("partial 2/3", out)
+        self.assertNotIn("partial", run(self.root, "search", "세션 만료"),
+                         "full-match results must never carry a partial marker")
+
+    def test_partial_requires_majority(self):
+        self.assertIn("no results",
+                      run(self.root, "search", "만료 zx존재안함 qq없음 ww없음"),
+                      "1/4 matched is below majority — must not surface")
+
+    def test_partial_keeps_field_filters_hard(self):
+        out = run(self.root, "search", "세션 만료 스크린샷 type:text")
+        self.assertIn("no results", out,
+                      "type: filter stays hard even in partial fallback")
+
+    def test_partial_json_flag(self):
+        data = json.loads(run(self.root, "search", "세션 만료 스크린샷", "--json"))
+        self.assertTrue(data["partial"])
+        self.assertEqual(data["results"][0]["partial"], "2/3")
+        data = json.loads(run(self.root, "search", "세션 만료", "--json"))
+        self.assertFalse(data["partial"])
+        self.assertNotIn("partial", data["results"][0])
+
 
 PDF_WITH_TEXT = (
     b"%PDF-1.1\n1 0 obj\n<< /Length 80 >>\nstream\n"

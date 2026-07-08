@@ -54,7 +54,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | Command | Purpose |
 |---------|---------|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
-| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed) |
+| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard) |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
@@ -1279,8 +1279,15 @@ def candidate_paths(db, terms, titles):
     return paths
 
 
-QUERY_TOKEN = re.compile(r'(?:(title|path|heading|tag):)?(?:"([^"]+)"|([^\s"]+))')
-FIELD_WEIGHT = {"title": 8, "path": 6, "heading": 5, "tag": 7}
+QUERY_TOKEN = re.compile(r'(?:(title|path|heading|tag|type):)?(?:"([^"]+)"|([^\s"]+))')
+FIELD_WEIGHT = {"title": 8, "path": 6, "heading": 5, "tag": 7, "type": 3}
+TYPE_EXTS = {
+    "md": {".md"},
+    "html": HTML_EXTS,
+    "pdf": {".pdf"},
+    "image": IMG_EXTS | {".svg"},
+    "text": PLAIN_EXTS,
+}
 
 
 def parse_query(q):
@@ -1297,6 +1304,9 @@ def cmd_search(root, db, args):
     terms = parse_query(args.query)
     if not terms:
         sys.exit("empty query")
+    for f, t in terms:
+        if f == "type" and t not in TYPE_EXTS:
+            sys.exit(f"unknown type: {t} (known: {', '.join(sorted(TYPE_EXTS))})")
     plain = [t for f, t in terms if f is None]
 
     matched_notes = []
@@ -1337,54 +1347,80 @@ def cmd_search(root, db, args):
                 chunk,
             ).fetchall()
 
-    results = []
-    for path, line, heading, content in rows:
-        title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
-        path_l = path.lower()
-        score, ok = 0, True
-        for f, t in terms:
-            if f == "title":
-                hit = t in title_l
-            elif f == "path":
-                hit = t in path_l
-            elif f == "heading":
-                hit = t in heading_l
-            elif f == "tag":
-                hit = any(t in tag for tag in doc_tags.get(path, ()))
-            else:
-                hit = t in title_l or t in path_l or t in heading_l or t in content_l
-            if not hit:
-                ok = False
-                break
-            if f is None:
-                score += (
-                    8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
-                    + min(content_l.count(t), 5)
-                )
-            else:
+    def collect(section_rows, require_all):
+        out = []
+        for path, line, heading, content in section_rows:
+            title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
+            path_l = path.lower()
+            score, ok, matched = 0, True, 0
+            for f, t in terms:
+                if f == "title":
+                    hit = t in title_l
+                elif f == "path":
+                    hit = t in path_l
+                elif f == "heading":
+                    hit = t in heading_l
+                elif f == "tag":
+                    hit = any(t in tag for tag in doc_tags.get(path, ()))
+                elif f == "type":
+                    hit = Path(path).suffix.lower() in TYPE_EXTS[t]
+                else:
+                    if t in title_l or t in path_l or t in heading_l or t in content_l:
+                        matched += 1
+                        score += (
+                            8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
+                            + min(content_l.count(t), 5)
+                        )
+                    elif require_all:
+                        ok = False
+                        break
+                    continue
+                # field filters are explicit constraints — hard even in partial mode
+                if not hit:
+                    ok = False
+                    break
                 score += FIELD_WEIGHT[f]
-        if ok:
-            results.append((score, path, line, heading, content))
+            if not ok or (plain and not matched) or (require_all and matched < len(plain)):
+                continue
+            # partial mode still demands a majority of terms — a single stray hit
+            # (e.g. "scan" inside a path) must not surface as a result
+            if not require_all and matched * 2 < len(plain):
+                continue
+            out.append((matched, score, path, line, heading, content))
+        return out
 
-    results.sort(key=lambda r: -r[0])
+    results = collect(rows, require_all=True)
+    partial = False
+    if not results and len(plain) >= 2:
+        # every-term AND came up empty — relax plain terms to OR, rank by how many
+        # matched (full scan: the FTS pre-filter above is AND-semantics too)
+        results = collect(db.execute("SELECT path, line, heading, content FROM sections"),
+                          require_all=False)
+        partial = True
+
+    results.sort(key=lambda r: (-r[0], -r[1]))
     if args.json:
         out = []
-        for score, path, line, heading, content in results[: args.n]:
+        for matched, score, path, line, heading, content in results[: args.n]:
             lines = content.splitlines()
             hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in plain)]
             rec = {"path": path, "line": line, "heading": heading,
                    "score": score, "matched": hits[:3]}
+            if partial:
+                rec["partial"] = f"{matched}/{len(plain)}"
             if args.full:
                 rec["content"] = content
             out.append(rec)
-        print(json.dumps({"query": args.query, "notes": matched_notes, "results": out},
+        print(json.dumps({"query": args.query, "notes": matched_notes,
+                          "partial": partial, "results": out},
                          ensure_ascii=False, indent=2))
         return
     if not results and not matched_notes:
         print("no results")
         return
-    for score, path, line, heading, content in results[: args.n]:
-        print(f"{path}:{line}  [{heading}]  (score {score})")
+    for matched, score, path, line, heading, content in results[: args.n]:
+        tag = f"partial {matched}/{len(plain)}, score {score}" if partial else f"score {score}"
+        print(f"{path}:{line}  [{heading}]  ({tag})")
         lines = content.splitlines()
         if args.full:
             for ln in lines:

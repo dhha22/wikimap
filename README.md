@@ -2,11 +2,13 @@
 
 [![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml)
 
-**Zero-LLM incremental index + lazy semantic layer for markdown knowledge bases.**
+English | [한국어](README.ko.md)
+
+**Zero-LLM incremental index + lazy semantic layer for knowledge vaults — markdown, HTML, PDF, and images.**
 
 One Python file. Zero dependencies. Zero LLM cost at build time — always. Sub-second updates, no matter how stale your index is.
 
-Built for AI coding assistants (Claude Code and friends) working against a markdown vault: an Obsidian vault, a team wiki, a folder of specs and plans.
+Built for AI coding assistants (Claude Code and friends) working against a knowledge vault: an Obsidian vault, a team wiki, a folder of specs, slides, and plans.
 
 ## Why not a knowledge-graph tool or RAG?
 

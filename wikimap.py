@@ -581,9 +581,17 @@ def stem_map(db):
     return {Path(p).stem.lower(): p for (p,) in db.execute("SELECT path FROM files")}
 
 
+def link_stem(dst):
+    # Extensionless targets can contain dots ([[wikimap-0.6.0-plan]]); Path.stem would
+    # truncate at the last dot, so only strip a suffix that is a real indexable ext.
+    name = Path(dst).name
+    suffix = Path(name).suffix.lower()
+    return (name[: -len(suffix)] if suffix in INDEX_EXTS else name).lower()
+
+
 def resolve_stem(stems, dst):
-    # wikilink targets may be path-style ([[insights/foo]]) — match by final stem
-    return stems.get(Path(dst).stem.lower())
+    # wikilink targets may be path-style ([[insights/foo]]) — match by final segment
+    return stems.get(link_stem(dst))
 
 
 def sources_fresh(db, sources):
@@ -1412,9 +1420,8 @@ def cmd_links(root, db, args):
         return
 
     stems = stem_map(db)
-    path = target if db.execute("SELECT 1 FROM files WHERE path=?", (target,)).fetchone() else stems.get(
-        Path(target).stem.lower()
-    )
+    path = (target if db.execute("SELECT 1 FROM files WHERE path=?", (target,)).fetchone()
+            else resolve_stem(stems, target))
     if not path:
         sys.exit(f"not found: {target}")
 
@@ -1462,7 +1469,7 @@ def cmd_path(root, db, args):
         t = norm_rel(t)
         if t in known:
             return t
-        return stems.get(Path(t).stem.lower())
+        return resolve_stem(stems, t)
 
     src, dst = resolve(args.src), resolve(args.dst)
     if not src:
@@ -1699,7 +1706,7 @@ def cmd_fix_links(root, db, args):
     for label, src in vault_health(db)["broken"]:
         raw = label[2:-2] if label.startswith("[[") else label
         cands = difflib.get_close_matches(
-            Path(raw).stem.lower(), sorted(stems.keys()), n=3, cutoff=0.6
+            link_stem(raw), sorted(stems.keys()), n=3, cutoff=0.6
         )
         items.append({"link": label, "in": src, "candidates": [stems[c] for c in cands]})
     if args.json:

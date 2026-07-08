@@ -588,6 +588,40 @@ class TestMvAndFixLinks(VaultTest):
         self.assertEqual(broken[0]["candidates"][0], "specs/auth-spec.md")
 
 
+class TestDottedFilenameLinks(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "plans/wikimap-0.6.0-plan.md",
+              "# wikimap 0.6.0 plan\n\ndotted filename target")
+        write(self.root, "notes/pointer.md",
+              "# pointer\n\nsee [[wikimap-0.6.0-plan]] and [[plans/wikimap-0.6.0-plan]]")
+        run(self.root, "update")
+
+    def test_wikilink_to_dotted_name_resolves(self):
+        out = run(self.root, "links", "plans/wikimap-0.6.0-plan.md")
+        self.assertIn("notes/pointer.md", out)
+        self.assertIn("(1 hops)", run(self.root, "path", "pointer", "wikimap-0.6.0-plan"))
+
+    def test_dotted_link_not_reported_broken(self):
+        data = json.loads(run(self.root, "fix-links", "--json"))
+        links = [b["link"] for b in data["broken"]]
+        self.assertNotIn("[[wikimap-0.6.0-plan]]", links)
+        self.assertNotIn("[[plans/wikimap-0.6.0-plan]]", links)
+
+    def test_mv_updates_inbound_links_to_dotted_name(self):
+        run(self.root, "mv", "plans/wikimap-0.6.0-plan.md",
+            "archive/plans/wikimap-0.6.0-plan.md", "--apply")
+        txt = (self.root / "notes/pointer.md").read_text(encoding="utf-8")
+        self.assertIn("[[archive/plans/wikimap-0.6.0-plan]]", txt)
+        self.assertNotIn("[[plans/wikimap-0.6.0-plan]]", txt)
+
+    def test_explicit_md_extension_in_wikilink_still_resolves(self):
+        write(self.root, "notes/ext-link.md", "# ext\n\nsee [[wikimap-0.6.0-plan.md]]")
+        run(self.root, "update")
+        out = run(self.root, "links", "plans/wikimap-0.6.0-plan.md")
+        self.assertIn("notes/ext-link.md", out)
+
+
 class TestInstallHook(VaultTest):
     def test_appends_to_existing_hook(self):
         run(self.root, "update")

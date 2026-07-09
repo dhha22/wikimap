@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields

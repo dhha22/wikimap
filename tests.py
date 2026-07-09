@@ -16,7 +16,8 @@ import unittest
 import zlib
 from pathlib import Path
 
-WIKIMAP = str(Path(__file__).parent / "wikimap.py")
+# absolute — tests that set cwd (install into a temp dir) must still find the tool
+WIKIMAP = str((Path(__file__).parent / "wikimap.py").resolve())
 
 
 def has_trigram():

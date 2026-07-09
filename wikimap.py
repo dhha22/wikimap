@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -69,6 +69,7 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `link add <doc> <target>... [--section H] [--apply]` | insert `- [[target]]` items into the doc's link-list section (reuses an existing Related/See also section, or one named with `--section` in any language, else creates `## Related`). Idempotent — an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run without `--apply` |
 | `embed set <doc> --vector <json>\|--stdin` / `embed status` | store an agent-generated embedding vector for a doc (pinned to its content sha — auto-stale when the file changes), or report coverage + which docs need (re)embedding. wikimap stores and searches vectors; the *agent* generates them — no build-time LLM, no bundled model |
 | `semsearch --vector <json>\|--stdin [-n 10]` | cosine-rank docs by an agent-supplied query embedding (language-agnostic semantic search; only fresh embeddings whose sha still matches are ranked) |
+| `search "<q>" --hybrid <json>\|-` | one-call hybrid: keyword ranking blended with an agent-supplied query embedding (docs found by both signals float up; semantic-only docs are spliced in). `-` reads the vector from stdin |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
 | `edge repin --src a.md --dst b.md` | after reviewing both ends of a stale edge: refresh the sha pins, keep the rationale |
 | `edges [--all] [--prune]` | list inferred connections |
@@ -84,7 +85,8 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 ## Rules for the agent
 
 1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files. For fact/value questions ("what is the limit/period/owner?"), retry with `-C 3` or `--full` before falling back to Read.
-   **Re-query before giving up**: on 0 results, a `partial` marker, or `weak: true`, re-search once with reformulated terms — synonyms, the concept behind the phrase, or the other language (Korean↔English) — before concluding the vault lacks it. The index is deterministic; the reformulation is your job. If reformulation still comes up weak and an embedding index exists (`embed status`), fall to the semantic path (rule 9).
+   **Ask in full sentences**: a whole conversational question ("탭 토글하면 N뱃지 다시 뜨던 버그 어떻게 막았어?") searches better than hand-picked keywords — long queries are matched by information content (rare terms carry the weight; function words are ignored) and rolled up per document, so you don't need to pre-distill the query. Reserve `field:` filters for when you truly want to constrain.
+   **Re-query before giving up**: on 0 results, a `partial` marker, or `weak: true`, re-search once with reformulated terms — synonyms, the concept behind the phrase, or the other language (Korean↔English) — before concluding the vault lacks it. The index is deterministic; the reformulation is your job. If reformulation still comes up weak and an embedding index exists (`embed status`), fall to the semantic path (rule 9) — or pass your query embedding straight into `search --hybrid` to get both halves in one call.
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
@@ -92,7 +94,7 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 7. **A stale edge whose connection still holds**: if it went stale only because an endpoint was edited, review both docs and run `edge repin --src a --dst b` — the rationale is kept, only the sha pins refresh. Re-add only when the relationship itself changed.
 8. **Bootstrapping a link-less corpus** (docs with no links between them): ① `suggest -n 0 --json` for the full candidate list. ② Judge each pair from its titles, headings, and the shared signals only — do not read whole files; the cost cap is the point. Work through candidates by `dir` stratum: `same` first, then `sibling`, and take `far` pairs only when their score is high — measured precision drops an order of magnitude from same-directory to far pairs. ③ Apply the genuine ones with `link add <doc> <target> --apply` (batch several targets per doc). Judge honestly: shared rare terms across unrelated projects (or matching REQ-IDs from different specs) are false signals — reject them.
-9. **Semantic search for natural-language questions** (the language-agnostic path, when keyword search comes up `weak` and reformulation doesn't help): keyword matching is substring-based, so a conversational question that shares no exact terms with the doc ("how is the impression flag reset?" vs a doc titled "노출 트래킹") won't match by keyword in any language. If an embedding index exists, generate a query embedding **yourself** (any embedding model — wikimap is model-agnostic) and run `semsearch --vector <json>`. To make docs searchable this way, embed them once: for each doc `embed set <path> --vector <json>` with a vector you generate; `embed status` shows what's missing or stale. wikimap only stores and cosine-ranks — the vectors, and the cost, are yours and scale with what you embed, not with build time.
+9. **Semantic search for natural-language questions** (the language-agnostic path, when keyword search comes up `weak` and reformulation doesn't help): keyword matching is substring-based, so a conversational question that shares no exact terms with the doc ("how is the impression flag reset?" vs a doc titled "노출 트래킹") won't match by keyword in any language. If an embedding index exists, generate a query embedding **yourself** (any embedding model — wikimap is model-agnostic) and either run `semsearch --vector <json>` for a pure semantic ranking, or `search "<q>" --hybrid <json>` to blend it with keyword hits in a single call (docs found by both signals rank highest). To make docs searchable this way, embed them once: for each doc `embed set <path> --vector <json>` with a vector you generate; `embed status` shows what's missing or stale. wikimap only stores and cosine-ranks — the vectors, and the cost, are yours and scale with what you embed, not with build time.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -1167,6 +1169,33 @@ def structure_words(paths, ratio=0.06):
     return {t for t, c in df.items() if c >= cutoff}
 
 
+def query_idf(db, terms):
+    """log(ndocs/df) per term over the corpus's searchable text — high for rare
+    content words, ~0 for function words that appear almost everywhere. Purely
+    corpus-derived (no hardcoded stoplist), so it stays language-agnostic: a term
+    like '그거'/'the'/'について' lands near 0 in any vault that uses it a lot."""
+    if not terms:
+        return {}, 0
+    df = {t: 0 for t in terms}
+    variants = {t: term_variants(t) for t in terms}
+    ndocs = 0
+    seen = {}
+    for path, title in db.execute("SELECT path, title FROM files"):
+        seen[path] = {"hay": (title or "").lower() + " " + path.lower()}
+        ndocs += 1
+    for path, heading, content in db.execute("SELECT path, heading, content FROM sections"):
+        if path in seen:
+            seen[path]["hay"] += " " + heading.lower() + " " + content.lower()
+    for rec in seen.values():
+        hay = rec["hay"]
+        for t in terms:
+            if any(v in hay for v in variants[t]):
+                df[t] += 1
+    ndocs = max(ndocs, 1)
+    idf = {t: math.log(ndocs / df[t]) if df[t] else math.log(ndocs) for t in terms}
+    return idf, sum(idf.values())
+
+
 def dir_proximity(a, b):
     pa, pb = Path(a).parent, Path(b).parent
     if pa == pb:
@@ -1732,6 +1761,8 @@ def candidate_paths(db, terms, titles, doc_aliases):
 QUERY_TOKEN = re.compile(r'(?:(title|path|heading|tag|type):)?(?:"([^"]+)"|([^\s"]+))')
 FIELD_WEIGHT = {"title": 8, "path": 6, "heading": 5, "tag": 7, "type": 3}
 WEAK_SCORE = 10
+LONG_QUERY = 6
+COVER_RATIO = 0.3
 TYPE_EXTS = {
     "md": {".md"},
     "html": HTML_EXTS,
@@ -1751,6 +1782,32 @@ def parse_query(q):
     return terms
 
 
+LATIN_RUN = re.compile(r"[a-z0-9]{2,}")
+
+
+def term_variants(term):
+    """Substrings to try when matching a query token against content — the token
+    carries surface morphology (particles/inflection) the doc doesn't: 'core:ui로'
+    → 'core','ui'; 'designsystem에' → 'designsystem'; '컴포넌트들' → prefixes down
+    to len 2. Language-agnostic: latin/digit runs cover embedded technical terms,
+    trailing-char trimming covers agglutinative scripts without any grammar table —
+    only prefixes that actually occur in the corpus survive the match test."""
+    # a quoted/multi-word phrase is an exact-order constraint — never loosen it
+    if " " in term:
+        return {term}
+    vs = {term}
+    latin = LATIN_RUN.findall(term)
+    vs.update(latin)
+    # trim up to 3 trailing chars so a particle/inflection-suffixed token can match
+    # its bare stem ('컴포넌트들'→'컴포넌트', '옮기고'→'옮기'); bounded to short tails
+    # to avoid 2-char prefixes of long tokens matching noise. Skip clean latin runs.
+    if not (len(latin) == 1 and latin[0] == term):
+        for i in range(1, 4):
+            if len(term) - i >= 2:
+                vs.add(term[: len(term) - i])
+    return {v for v in vs if len(v) >= 2}
+
+
 def cmd_search(root, db, args):
     terms = parse_query(args.query)
     if not terms:
@@ -1758,6 +1815,10 @@ def cmd_search(root, db, args):
     for f, t in terms:
         if f == "type" and t not in TYPE_EXTS:
             sys.exit(f"unknown type: {t} (known: {', '.join(sorted(TYPE_EXTS))})")
+    # a 1-char plain token ('안','한','왜') is a function word with no discriminative
+    # value, yet as a rare literal it scores a deceptively high idf and can dominate
+    # the coverage gate. Drop it — field-qualified terms are kept regardless.
+    terms = [(f, t) for f, t in terms if f is not None or len(t) >= 2]
     plain = [t for f, t in terms if f is None]
 
     matched_notes = []
@@ -1784,10 +1845,15 @@ def cmd_search(root, db, args):
     doc_aliases = {}
     for p, a in db.execute("SELECT path, alias FROM aliases"):
         doc_aliases.setdefault(p, []).append(a.lower())
-    fts_terms = [t for f, t in terms if f in (None, "heading")]
+    idf, total_idf = query_idf(db, plain)
+    # a conversational query ("그거 왜 그랬어") is mostly function words: AND-matching
+    # every plain term is impossible, so long queries skip the AND pre-filter and go
+    # straight to an idf-gated OR over a full scan. Short queries keep strict AND.
+    long_query = len(plain) >= LONG_QUERY
+    fts_terms = [] if long_query else [t for f, t in terms if f in (None, "heading")]
     paths = candidate_paths(db, fts_terms, titles, doc_aliases) if fts_terms else None
     if paths is None:
-        rows = db.execute("SELECT path, line, heading, content FROM sections")
+        rows = db.execute("SELECT path, line, heading, content FROM sections").fetchall()
     elif not paths:
         rows = []
     else:
@@ -1801,13 +1867,19 @@ def cmd_search(root, db, args):
                 chunk,
             ).fetchall()
 
+    pvariants = {t: term_variants(t) for f, t in terms if f is None}
+
     def collect(section_rows, require_all):
-        out = []
+        # roll matches up to the DOCUMENT: plain terms scattered across several
+        # sections of one doc are unioned, so a doc that mentions each query term
+        # once (in different sections) still clears the coverage gate. The single
+        # best-scoring section is kept for display.
+        docs = {}
         for path, line, heading, content in section_rows:
             title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
             path_l = path.lower()
             al = doc_aliases.get(path, ())
-            score, ok, matched = 0, True, 0
+            sec_score, ok, sec_terms = 0, True, set()
             for f, t in terms:
                 if f == "title":
                     hit = t in title_l or any(t in a for a in al)
@@ -1820,74 +1892,146 @@ def cmd_search(root, db, args):
                 elif f == "type":
                     hit = Path(path).suffix.lower() in TYPE_EXTS[t]
                 else:
-                    alias_hit = any(t in a for a in al)
-                    if t in title_l or alias_hit or t in path_l or t in heading_l or t in content_l:
-                        matched += 1
-                        score += (
-                            8 * (t in title_l or alias_hit) + 6 * (t in path_l)
-                            + 5 * (t in heading_l) + min(content_l.count(t), 5)
+                    vs = pvariants[t]
+                    in_title = any(v in title_l for v in vs)
+                    alias_hit = any(v in a for v in vs for a in al)
+                    in_path = any(v in path_l for v in vs)
+                    in_head = any(v in heading_l for v in vs)
+                    in_body = any(v in content_l for v in vs)
+                    if in_title or alias_hit or in_path or in_head or in_body:
+                        sec_terms.add(t)
+                        w = 1 + idf.get(t, 0)
+                        sec_score += w * (
+                            8 * (in_title or alias_hit) + 6 * in_path
+                            + 5 * in_head + min(sum(content_l.count(v) for v in vs), 5)
                         )
-                    elif require_all:
-                        ok = False
-                        break
                     continue
-                # field filters are explicit constraints — hard even in partial mode
+                # field filters are explicit constraints — hard even in partial mode.
+                # they're evaluated per section: a section that fails is skipped, but
+                # another section of the same doc may still satisfy the constraint
+                # (heading:X only ever matches the section whose heading is X).
                 if not hit:
                     ok = False
                     break
-                score += FIELD_WEIGHT[f]
-            if not ok or (plain and not matched) or (require_all and matched < len(plain)):
+                sec_score += FIELD_WEIGHT[f]
+            if not ok:
                 continue
-            # partial mode still demands a majority of terms — a single stray hit
-            # (e.g. "scan" inside a path) must not surface as a result
-            if not require_all and matched * 2 < len(plain):
+            d = docs.get(path)
+            if d is None:
+                docs[path] = [set(sec_terms), sec_score, line, heading, content]
+            else:
+                d[0] |= sec_terms
+                if sec_score > d[1]:
+                    d[1], d[2], d[3], d[4] = sec_score, line, heading, content
+
+        out = []
+        for path, (mterms, score, line, heading, content) in docs.items():
+            if plain and not mterms:
                 continue
-            out.append((matched, score, path, line, heading, content))
+            if require_all and len(mterms) < len(plain):
+                continue
+            matched_idf = sum(idf.get(t, 0) for t in mterms)
+            top_idf = max((idf.get(t, 0) for t in plain), default=0)
+            if not require_all and plain:
+                if long_query:
+                    # conversational query: function words dilute any count-based
+                    # coverage, so gate on idf mass — a doc passes if its matched
+                    # terms carry a majority of the query's information, or if it
+                    # matches the single most distinctive term outright.
+                    covers = matched_idf >= COVER_RATIO * total_idf
+                    hits_rare = top_idf > 0 and any(
+                        idf.get(t, 0) >= top_idf * 0.999 for t in mterms)
+                    if not (covers or hits_rare):
+                        continue
+                else:
+                    # short OR-fallback keeps the original count majority: a lone
+                    # stray hit ('scan' inside a 'scans/' path) must not surface.
+                    if len(mterms) * 2 < len(plain):
+                        continue
+            out.append((len(mterms), matched_idf, score, path, line, heading, content))
         return out
 
-    results = collect(rows, require_all=True)
-    partial = False
-    if not results and len(plain) >= 2:
-        # every-term AND came up empty — relax plain terms to OR, rank by how many
-        # matched (full scan: the FTS pre-filter above is AND-semantics too)
-        results = collect(db.execute("SELECT path, line, heading, content FROM sections"),
+    results = collect(rows, require_all=not long_query)
+    partial = long_query
+    if not results and not long_query and len(plain) >= 2:
+        # every-term AND came up empty — relax plain terms to an idf-gated OR
+        results = collect(db.execute("SELECT path, line, heading, content FROM sections").fetchall(),
                           require_all=False)
         partial = True
 
-    results.sort(key=lambda r: (-r[0], -r[1]))
+    results.sort(key=lambda r: (-r[2], -r[1], -r[0]))
     # a weak result set (empty, partial-fallback, or a low top score) is the signal
     # for an agent to generate a query embedding and retry with `semsearch` — the
     # semantic half of the re-query loop. Keyword search stays the fast $0 default.
-    top_score = results[0][1] if results else 0
+    top_score = results[0][2] if results else 0
     weak = (not results) or partial or top_score < WEAK_SCORE
+    # highlight on the term variants actually matched, not the raw tokens — a
+    # particle-suffixed query token ('컴포넌트들') should still light up its stem
+    hl = {v for t in plain for v in pvariants[t]}
+
+    # --hybrid: if the agent supplied a query vector, blend semantic hits into the
+    # keyword ranking here so a single call returns both halves. Generation still
+    # lives in the caller (vector via --vector/--stdin); the core only ranks.
+    sem_ranks = {}
+    if getattr(args, "hybrid", None) is not None:
+        try:
+            qvec = json.loads(sys.stdin.read() if args.hybrid == "-" else args.hybrid)
+            for rank, (c, p) in enumerate(semantic_hits(db, qvec, max(args.n, 20))):
+                sem_ranks[p] = (rank, c)
+        except (ValueError, TypeError):
+            sys.exit("--hybrid expects a JSON query vector (or '-' to read one from stdin)")
+        kw_paths = {r[3] for r in results}
+        for p, (rank, c) in sem_ranks.items():
+            if p not in kw_paths:
+                # semantic-only doc: splice in with a synthetic score below keyword
+                # hits but above nothing, ordered by cosine
+                row = db.execute(
+                    "SELECT line, heading, content FROM sections WHERE path=? ORDER BY line LIMIT 1",
+                    (p,)).fetchone()
+                if row:
+                    results.append((0, 0.0, WEAK_SCORE * c, p, row[0], row[1], row[2]))
+        # re-rank: docs found by BOTH signals float up; cosine breaks keyword ties
+        def blended(r):
+            p = r[3]
+            sem = sem_ranks.get(p)
+            boost = (1.0 + sem[1]) if sem else 1.0
+            return -(r[2] * boost)
+        results.sort(key=blended)
+        weak = not results
+
     if args.json:
         out = []
-        for matched, score, path, line, heading, content in results[: args.n]:
+        for nmatched, midf, score, path, line, heading, content in results[: args.n]:
             lines = content.splitlines()
-            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in plain)]
+            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in hl)]
             rec = {"path": path, "line": line, "heading": heading,
-                   "score": score, "matched": hits[:3]}
+                   "score": round(score, 2), "matched": hits[:3]}
+            if path in sem_ranks:
+                rec["cosine"] = round(sem_ranks[path][1], 4)
             if partial:
-                rec["partial"] = f"{matched}/{len(plain)}"
+                rec["partial"] = f"{nmatched}/{len(plain)}"
             if args.full:
                 rec["content"] = content
             out.append(rec)
         print(json.dumps({"query": args.query, "notes": matched_notes,
-                          "partial": partial, "weak": weak, "results": out},
+                          "partial": partial, "weak": weak,
+                          "hybrid": bool(sem_ranks), "results": out},
                          ensure_ascii=False, indent=2))
         return
     if not results and not matched_notes:
         print("no results")
         return
-    for matched, score, path, line, heading, content in results[: args.n]:
-        tag = f"partial {matched}/{len(plain)}, score {score}" if partial else f"score {score}"
+    for nmatched, midf, score, path, line, heading, content in results[: args.n]:
+        tag = f"partial {nmatched}/{len(plain)}, score {score:.1f}" if partial else f"score {score:.1f}"
+        if path in sem_ranks:
+            tag += f", cos {sem_ranks[path][1]:.3f}"
         print(f"{path}:{line}  [{heading}]  ({tag})")
         lines = content.splitlines()
         if args.full:
             for ln in lines:
                 print(f"  {ln.rstrip()}")
             continue
-        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in plain)]
+        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in hl)]
         if args.context:
             shown = set()
             for i in hits:
@@ -2554,6 +2698,9 @@ def main():
                     help="show N context lines around each matched line")
     sp.add_argument("--full", action="store_true", help="print the whole matched section")
     sp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
+    sp.add_argument("--hybrid", metavar="VEC", nargs="?", const="-",
+                    help="blend agent-supplied query embedding into the ranking "
+                         "(JSON array, or '-'/omitted value to read from stdin)")
 
     lp = sub.add_parser("links", help="outlinks/backlinks of a doc, or docs for a REQ-ID")
     lp.add_argument("target")

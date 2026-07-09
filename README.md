@@ -37,6 +37,32 @@ At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time �
 
 On an expanded 30-query golden set (Korean/English/mixed, 309-doc vault): **recall@5 30/30, avg 67 ms** (re-verified at 30/30 after HTML indexing in 0.5.0, the semantics-file migration in 0.6.0, PDF/image indexing in 0.7.0, CMap decoding + partial-match fallback in 0.8.0, alias indexing in 0.9.0, and the suggest proximity ranking in 0.10.0). On a separate blind benchmark — 20 fresh natural queries written and judged by agents that didn't know which tools were being compared — wikimap scored recall@5 14/20 vs graphify's 11/20 (cited anywhere in its output), and won the blind usefulness vote 16:3:1 with three judges unanimous on all 20 queries. Ranking changes are gated by this kind of golden set in CI — the test suite (`python3 tests.py`, stdlib only) covers incremental sync, ghost-free deletes, byte-identical determinism, FTS consistency at scale, CJK short-term fallback, ignore config, map relocation, HTML tag-strip indexing, semantics surviving DB deletion, the ≤0.5.x migration path, `--json` schemas, hook append-preservation, phrase/field/tag/type queries, partial-fallback marking, PDF noise exclusion, per-font CMap decoding (CID hex/literal, bfrange, ASCII85+Flate chains, Form XObjects, Type3), image alt indexing, dotted-filename wikilink resolution, `mv` reference rewriting, console-script installs, install never touching an existing `SKILL.md`, multi-target skill installs (Claude Code + the open agent-skills path) with per-target preservation, idempotent `AGENTS.md` block registration, corpus-derived structure-word filtering (no hardcoded vocabulary), sha-pinned agent-supplied embeddings with cosine `semsearch` and auto-stale on edit, frontmatter alias search and alias wikilink resolution, idempotent `link add` insertion, the parser-version cache rescan, and directory-proximity candidate enumeration with filename-token ranking. CI runs it on macOS, Linux, and Windows, Python 3.8 and 3.13.
 
+### Natural-language search vs graphify — v5 blind benchmark (0.13.0)
+
+Earlier golden sets echoed document titles. The **v5** set does the opposite: 71 conversational questions aimed at the *body* of a doc (a decision, a number, an edge case), written by per-document agents that read the source and never saw a title. The answer key shares **zero documents** with the v3 and v4 sets, so a gain here is real search skill, not overfitting. Both tools run on the same 270-doc corpus; graphify reuses its v1 graph (314 s + 2.4M tokens to build), wikimap indexes in 0.23 s at $0.
+
+```mermaid
+xychart-beta
+    title "v5 natural-language search — recall / MRR (71 queries, higher is better)"
+    x-axis ["recall@1", "recall@3", "recall@5", "recall@10", "MRR"]
+    y-axis "score" 0 --> 1
+    bar [0.507, 0.761, 0.789, 0.803, 0.627]
+    bar [0.183, 0.394, 0.563, 0.690, 0.338]
+```
+
+<sub>■ front bars = **wikimap 0.13.0** · ■ back bars = graphify (v1 graph, BFS)</sub>
+
+| Metric | wikimap 0.13.0 | graphify | wikimap advantage |
+|---|---|---|---|
+| recall@1 | **0.507** | 0.183 | 2.8× |
+| recall@3 | **0.761** | 0.394 | 1.9× |
+| recall@5 | **0.789** | 0.563 | 1.4× |
+| recall@10 | **0.803** | 0.690 | 1.2× |
+| MRR | **0.627** | 0.338 | 1.9× |
+| Link-generation (270 docs) | **0.59 s, 0 tokens** | 314 s, 2.4M tokens | 533× faster, $0 |
+
+This is the first version where wikimap leads graphify on **every** retrieval metric — a reversal from v3, where it trailed 5× on the same kind of set. The lift comes from 0.13.0's query-time matching, all at build-time-LLM $0: idf-weighted coverage gating (function words drop out by corpus frequency, no hardcoded stoplist), document-level rollup of matches scattered across sections, long-query auto-OR, and language-agnostic term variants that bridge agglutinative morphology (`core:ui로` → `core`, `ui`). The residual misses all surface `weak: true` — the designed cue for the assistant to rewrite the query or fold in an on-demand embedding via `search --hybrid`, so keyword-only scoring is a floor, not the ceiling.
+
 Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
 
 ## Install

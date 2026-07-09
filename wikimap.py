@@ -27,7 +27,11 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
+
+# bump when parse_file output changes shape/semantics — forces a full reparse of
+# cached index.db files that would otherwise silently miss the new fields
+PARSER_VERSION = "2"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -55,12 +59,13 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | Command | Purpose |
 |---------|---------|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
-| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard) |
+| `search "query" [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard) |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
-| `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM); `--wikilink` prints paste-ready `[[links]]` for the doc body |
+| `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM); `-n 0` = no cap (bootstrap sweeps); `--wikilink` prints paste-ready `[[links]]` for the doc body |
+| `link add <doc> <target>... [--section H] [--apply]` | insert `- [[target]]` items into the doc's link-list section (reuses an existing Related/See also/관련 문서 section, else creates `## Related`). Idempotent — an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run without `--apply` |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
 | `edge repin --src a.md --dst b.md` | after reviewing both ends of a stale edge: refresh the sha pins, keep the rationale |
 | `edges [--all] [--prune]` | list inferred connections |
@@ -76,12 +81,14 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 ## Rules for the agent
 
 1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files. For fact/value questions ("what is the limit/period/owner?"), retry with `-C 3` or `--full` before falling back to Read.
+   **Re-query before giving up**: on 0 results or a `partial` marker, re-search once with reformulated terms — synonyms, the concept behind the phrase, or the other language (Korean↔English) — before concluding the vault lacks it. The index is deterministic; the reformulation is your job.
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
 5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5 --wikilink`, read the candidates' relevant sections, and paste only the genuinely related `[[links]]` into the doc body (a "Related" line is fine) — explicit links are readable by every vault tool and survive re-indexing. Use `edge add` only when you can't edit the doc. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 7. **A stale edge whose connection still holds**: if it went stale only because an endpoint was edited, review both docs and run `edge repin --src a --dst b` — the rationale is kept, only the sha pins refresh. Re-add only when the relationship itself changed.
+8. **Bootstrapping a link-less corpus** (docs with no links between them): ① `suggest -n 0 --json` for the full candidate list. ② Judge each pair from its titles, headings, and the shared signals only — do not read whole files; the cost cap is the point. ③ Apply the genuine ones with `link add <doc> <target> --apply` (batch several targets per doc). Judge honestly: shared rare terms across unrelated projects (or matching REQ-IDs from different specs) are false signals — reject them.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -145,6 +152,8 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS tags(path TEXT, tag TEXT);
         CREATE INDEX IF NOT EXISTS idx_tags_path ON tags(path);
+        CREATE TABLE IF NOT EXISTS aliases(path TEXT, alias TEXT);
+        CREATE INDEX IF NOT EXISTS idx_aliases_path ON aliases(path);
         CREATE TABLE IF NOT EXISTS img_alts(src TEXT, dst TEXT, alt TEXT);
         CREATE INDEX IF NOT EXISTS idx_img_alts_src ON img_alts(src);
         """
@@ -205,13 +214,25 @@ def parse_frontmatter(lines):
     meta = {}
     end = 0
     if lines and lines[0].strip() == "---":
+        pending = None
         for i in range(1, len(lines)):
             if lines[i].strip() == "---":
                 end = i + 1
                 break
             m = re.match(r"^(\w[\w-]*):\s*(.*)$", lines[i])
             if m:
-                meta[m.group(1).lower()] = m.group(2).strip().strip("\"'")
+                key, val = m.group(1).lower(), m.group(2).strip().strip("\"'")
+                meta[key] = val
+                pending = key if not val else None
+                continue
+            lm = re.match(r"^\s*-\s+(.*)$", lines[i]) if pending else None
+            if lm:
+                # YAML block list ("aliases:\n  - x") — join into the same
+                # comma form as the inline "[a, b]" syntax
+                item = lm.group(1).strip()
+                meta[pending] = (meta[pending] + ", " if meta[pending] else "") + item
+            else:
+                pending = None
     return meta, end
 
 
@@ -773,12 +794,13 @@ def parse_file(root: Path, path: Path):
 
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    html_hrefs, html_imgs, tags = [], [], []
+    html_hrefs, html_imgs, tags, aliases = [], [], [], []
 
     if suffix == ".md":
         meta, body_start = parse_frontmatter(lines)
         title = meta.get("title") or ""
         tags = parse_frontmatter_tags(meta.get("tags", ""))
+        aliases = parse_frontmatter_tags(meta.get("aliases", ""))
         sections = []
         cur_heading, cur_level, cur_line, buf = "(intro)", 0, body_start + 1, []
         for i in range(body_start, len(lines)):
@@ -860,6 +882,7 @@ def parse_file(root: Path, path: Path):
         "sections": sections,
         "links": links,
         "tags": tags,
+        "aliases": aliases,
         "img_alts": img_alts,
     }
 
@@ -904,7 +927,11 @@ def scan_files(root: Path, skipped: Counter = None, ignore_patterns=None, skip_r
 
 
 def stem_map(db):
-    return {Path(p).stem.lower(): p for (p,) in db.execute("SELECT path FROM files")}
+    # aliases first so a real file stem always wins a name collision
+    stems = {a.lower(): p for p, a in db.execute("SELECT path, alias FROM aliases")}
+    for (p,) in db.execute("SELECT path FROM files"):
+        stems[Path(p).stem.lower()] = p
+    return stems
 
 
 def link_stem(dst):
@@ -1178,7 +1205,7 @@ def cmd_suggest(root, db, args):
         if Path(key[0]).parts[:2] != Path(key[1]).parts[:2]:
             scores[key] *= 1.3
 
-    top = sorted(scores.items(), key=lambda x: -x[1])[: args.n]
+    top = sorted(scores.items(), key=lambda x: -x[1])[: args.n or None]
     if args.json:
         print(json.dumps({"doc": doc_filter, "candidates": [
             {"a": a, "b": b, "score": round(s, 2), "signals": why[(a, b)][:6]}
@@ -1362,6 +1389,15 @@ def cmd_update(root, db, args):
     seen, changed_rels = set(), []
     row = db.execute("SELECT value FROM meta WHERE key='pdf_name_only'").fetchone()
     pdf_no = set(json.loads(row[0])) if row else set()
+    row = db.execute("SELECT value FROM meta WHERE key='parser_version'").fetchone()
+    if (row[0] if row else None) != PARSER_VERSION:
+        # cached rows predate the current parser — they'd silently miss new fields
+        for t in ("files", "sections", "links", "tags", "aliases", "img_alts"):
+            db.execute(f"DELETE FROM {t}")
+        if has_fts(db):
+            db.execute("DELETE FROM sections_fts")
+        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('parser_version', ?)",
+                   (PARSER_VERSION,))
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
     for p in scan_files(root, skipped, patterns, skip_rels):
         rel = p.relative_to(root).as_posix()
@@ -1376,6 +1412,7 @@ def cmd_update(root, db, args):
         db.execute("DELETE FROM sections WHERE path=?", (rel,))
         db.execute("DELETE FROM links WHERE src=?", (rel,))
         db.execute("DELETE FROM tags WHERE path=?", (rel,))
+        db.execute("DELETE FROM aliases WHERE path=?", (rel,))
         db.execute("DELETE FROM img_alts WHERE src=?", (rel,))
         db.execute(
             "INSERT OR REPLACE INTO files VALUES(?,?,?,?,?)",
@@ -1385,6 +1422,8 @@ def cmd_update(root, db, args):
         db.executemany("INSERT INTO links VALUES(?,?,?)", parsed["links"])
         db.executemany("INSERT INTO tags VALUES(?,?)",
                        [(rel, t) for t in parsed.get("tags", [])])
+        db.executemany("INSERT INTO aliases VALUES(?,?)",
+                       [(rel, a) for a in parsed.get("aliases", [])])
         db.executemany("INSERT INTO img_alts VALUES(?,?,?)", parsed.get("img_alts", []))
         if rel.lower().endswith(".pdf"):
             pdf_no.add(rel) if parsed.get("pdf_name_only") else pdf_no.discard(rel)
@@ -1396,6 +1435,7 @@ def cmd_update(root, db, args):
         db.execute("DELETE FROM sections WHERE path=?", (rel,))
         db.execute("DELETE FROM links WHERE src=?", (rel,))
         db.execute("DELETE FROM tags WHERE path=?", (rel,))
+        db.execute("DELETE FROM aliases WHERE path=?", (rel,))
         db.execute("DELETE FROM img_alts WHERE src=?", (rel,))
         pdf_no.discard(rel)
     db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('pdf_name_only', ?)",
@@ -1575,7 +1615,7 @@ def write_map(root, db):
     target.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
-def candidate_paths(db, terms, titles):
+def candidate_paths(db, terms, titles, doc_aliases):
     """FTS5 pre-filter: docs that can possibly satisfy every term.
 
     Returns None to request a full linear scan (no FTS, or a term shorter
@@ -1587,7 +1627,11 @@ def candidate_paths(db, terms, titles):
     for t in terms:
         if len(t) < 3:
             return None
-        cur = {p for p in titles if t in p.lower() or t in (titles[p] or "").lower()}
+        cur = {
+            p for p in titles
+            if t in p.lower() or t in (titles[p] or "").lower()
+            or any(t in a for a in doc_aliases.get(p, ()))
+        }
         match = '"%s"' % t.replace('"', '""')
         try:
             cur |= {
@@ -1656,8 +1700,11 @@ def cmd_search(root, db, args):
     doc_tags = {}
     for p, t in db.execute("SELECT path, tag FROM tags"):
         doc_tags.setdefault(p, set()).add(t)
+    doc_aliases = {}
+    for p, a in db.execute("SELECT path, alias FROM aliases"):
+        doc_aliases.setdefault(p, []).append(a.lower())
     fts_terms = [t for f, t in terms if f in (None, "heading")]
-    paths = candidate_paths(db, fts_terms, titles) if fts_terms else None
+    paths = candidate_paths(db, fts_terms, titles, doc_aliases) if fts_terms else None
     if paths is None:
         rows = db.execute("SELECT path, line, heading, content FROM sections")
     elif not paths:
@@ -1678,10 +1725,11 @@ def cmd_search(root, db, args):
         for path, line, heading, content in section_rows:
             title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
             path_l = path.lower()
+            al = doc_aliases.get(path, ())
             score, ok, matched = 0, True, 0
             for f, t in terms:
                 if f == "title":
-                    hit = t in title_l
+                    hit = t in title_l or any(t in a for a in al)
                 elif f == "path":
                     hit = t in path_l
                 elif f == "heading":
@@ -1691,11 +1739,12 @@ def cmd_search(root, db, args):
                 elif f == "type":
                     hit = Path(path).suffix.lower() in TYPE_EXTS[t]
                 else:
-                    if t in title_l or t in path_l or t in heading_l or t in content_l:
+                    alias_hit = any(t in a for a in al)
+                    if t in title_l or alias_hit or t in path_l or t in heading_l or t in content_l:
                         matched += 1
                         score += (
-                            8 * (t in title_l) + 6 * (t in path_l) + 5 * (t in heading_l)
-                            + min(content_l.count(t), 5)
+                            8 * (t in title_l or alias_hit) + 6 * (t in path_l)
+                            + 5 * (t in heading_l) + min(content_l.count(t), 5)
                         )
                     elif require_all:
                         ok = False
@@ -1942,6 +1991,95 @@ def cmd_notes(root, db, args):
 MDURL = re.compile(r"\]\(([^)#\s]+)\)")
 
 
+RELATED_HEADINGS = {"related", "related pages", "related docs", "see also", "links",
+                    "관련 문서", "관련 페이지"}
+
+
+def cmd_link_add(root, db, args):
+    doc = norm_rel(args.doc)
+    p = root / doc
+    if not p.is_file():
+        sys.exit(f"not found: {doc}")
+    if p.suffix.lower() != ".md":
+        sys.exit(f"link add writes wikilinks into markdown docs only: {doc}")
+    stems = stem_map(db)
+    known = {q for (q,) in db.execute("SELECT path FROM files")}
+    text = p.read_text(encoding="utf-8", errors="replace")
+
+    linked = set()
+    for m in WIKILINK.finditer(text):
+        t = resolve_stem(stems, m.group(1).strip())
+        if t:
+            linked.add(t)
+    for m in MDLINK.finditer(text):
+        url = m.group(1)
+        try:
+            linked.add((p.parent / url).resolve().relative_to(root).as_posix())
+        except ValueError:
+            linked.add(norm_rel(url))
+
+    to_add = []
+    for raw in args.targets:
+        target = resolve_stem(stems, raw)
+        if not target and norm_rel(raw) in known:
+            target = norm_rel(raw)
+        if not target:
+            sys.exit(f"target not in index: {raw} (run update first?)")
+        if target == doc:
+            print(f"  skip {raw}: a doc cannot link to itself")
+            continue
+        if target in linked:
+            print(f"  already linked: {target} — no change")
+            continue
+        stem = Path(target).stem
+        # a colliding stem resolves to another file — fall back to a path-style link
+        label = stem if stems.get(stem.lower()) == target else (
+            target[: -len(Path(target).suffix)] if Path(target).suffix else target)
+        to_add.append((target, label))
+        linked.add(target)
+
+    if not to_add:
+        print("nothing to add")
+        return
+
+    lines = text.splitlines()
+    wanted = {args.section.casefold()} if args.section else RELATED_HEADINGS
+    sec_start = sec_level = None
+    for i, ln in enumerate(lines):
+        m = HEADING.match(ln)
+        if m and m.group(2).strip().casefold() in wanted:
+            sec_start, sec_level = i, len(m.group(1))
+            break
+
+    new_items = ["- [[%s]]" % label for _, label in to_add]
+    if sec_start is None:
+        heading = "## " + (args.section or "Related")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        insert_desc = f"new '{heading}' section at end of file"
+        lines += ["", heading] + new_items
+    else:
+        end = len(lines)
+        for j in range(sec_start + 1, len(lines)):
+            m = HEADING.match(lines[j])
+            if m and len(m.group(1)) <= sec_level:
+                end = j
+                break
+        while end > sec_start + 1 and not lines[end - 1].strip():
+            end -= 1
+        insert_desc = f"under '{lines[sec_start].strip()}' (line {sec_start + 1})"
+        lines[end:end] = new_items
+
+    for target, label in to_add:
+        print(f"link add {doc} + [[{label}]]  ({target})")
+    print(f"  insert: {insert_desc}")
+    if not args.apply:
+        print("dry run — nothing written. Re-run with --apply to execute.")
+        return
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    cmd_update(root, db, argparse.Namespace(ignore=[], map_path=None, no_map=False))
+
+
 def cmd_mv(root, db, args):
     old, new = norm_rel(args.old), norm_rel(args.new)
     old_abs, new_abs = root / old, root / new
@@ -1955,6 +2093,9 @@ def cmd_mv(root, db, args):
     stems = stem_map(db)
     old_stem, new_stem = Path(old).stem, Path(new).stem
     new_no_ext = new[: -len(Path(new).suffix)] if Path(new).suffix else new
+    # [[alias]] links travel with the file's frontmatter — still valid after the move
+    alias_keys = {a.lower() for (a,) in db.execute(
+        "SELECT alias FROM aliases WHERE path=?", (old,))}
 
     def resolve_from(src_rel, url):
         resolved = ((root / src_rel).parent / url).resolve()
@@ -1981,6 +2122,8 @@ def cmd_mv(root, db, args):
 
         def wiki_sub(m):
             target = m.group(1).strip()
+            if link_stem(target) in alias_keys:
+                return m.group(0)
             if resolve_stem(stems, target) == old:
                 repl = new_no_ext if "/" in target else new_stem
                 if repl != target:
@@ -2190,6 +2333,16 @@ def main():
     fl = sub.add_parser("fix-links", help="suggest targets for broken links (suggestions only)")
     fl.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
+    lk = sub.add_parser("link", help="insert a [[wikilink]] into a doc's link-list section "
+                                     "(idempotent; dry run by default)")
+    lk.add_argument("action", choices=["add"])
+    lk.add_argument("doc", help="vault-relative markdown doc to edit")
+    lk.add_argument("targets", nargs="+", help="link targets (stem, alias, or vault-relative path)")
+    lk.add_argument("--section", default=None,
+                    help="heading of the list section to use (default: reuse an existing "
+                         "Related/See also/관련 문서 style section, else create '## Related')")
+    lk.add_argument("--apply", action="store_true", help="actually write (default: dry run)")
+
     pp = sub.add_parser("path", help="shortest link path between two docs (BFS over links + fresh edges)")
     pp.add_argument("src")
     pp.add_argument("dst")
@@ -2211,7 +2364,7 @@ def main():
 
     sg = sub.add_parser("suggest", help="heuristic candidates for inferred doc connections (no LLM)")
     sg.add_argument("--doc", help="limit to pairs involving this vault-relative path")
-    sg.add_argument("-n", type=int, default=10)
+    sg.add_argument("-n", type=int, default=10, help="max candidates (0 = no cap)")
     sg.add_argument("--max-df", type=int, default=4, dest="max_df")
     sg.add_argument("--wikilink", action="store_true",
                     help="print candidates as paste-ready [[wikilinks]] for the doc body")
@@ -2257,6 +2410,8 @@ def main():
             cmd_mv(root, db, args)
         elif args.cmd == "fix-links":
             cmd_fix_links(root, db, args)
+        elif args.cmd == "link":
+            cmd_link_add(root, db, args)
         elif args.cmd == "note":
             cmd_note_add(root, db, args)
         elif args.cmd == "notes":

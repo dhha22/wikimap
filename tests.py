@@ -828,5 +828,122 @@ class TestInstallPreservesSkill(unittest.TestCase):
         self.assertEqual(copied, (site / "wikimap.py").read_text(encoding="utf-8"))
 
 
+class TestAliases(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "profile/resume-ja.md", "\n".join([
+            "---", "title: 職務経歴書", "aliases: [일본어 경력기술서, japanese resume]", "---",
+            "# 職務経歴書", "", "## アプリ起動時間", "起動時間を58%短縮した。",
+        ]))
+        write(self.root, "notes/block-alias.md", "\n".join([
+            "---", "title: block doc", "aliases:", "  - 블록별칭", "  - second name", "---",
+            "# block doc", "", "본문 내용.",
+        ]))
+        run(self.root, "update")
+
+    def test_alias_matches_at_title_weight(self):
+        out = run(self.root, "search", "일본어 경력기술서")
+        self.assertTrue(out.splitlines()[0].startswith("profile/resume-ja.md"), out)
+
+    def test_block_list_form(self):
+        self.assertIn("notes/block-alias.md", run(self.root, "search", "블록별칭"))
+        self.assertIn("notes/block-alias.md", run(self.root, "search", "second name"))
+
+    def test_title_field_filter_matches_alias(self):
+        self.assertIn("profile/resume-ja.md",
+                      run(self.root, "search", 'title:"japanese resume"'))
+
+    def test_alias_wikilink_resolves(self):
+        write(self.root, "notes/pointer.md", "# pointer\n\n[[일본어 경력기술서]] 참고.")
+        run(self.root, "update")
+        self.assertIn("notes/pointer.md", run(self.root, "links", "profile/resume-ja.md"))
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertNotIn("일본어 경력기술서", map_md.split("Health")[-1])
+
+    def test_real_file_stem_wins_alias_collision(self):
+        write(self.root, "notes/impostor.md", "\n".join([
+            "---", "aliases: [auth-plan]", "---", "# impostor", "", "본문.",
+        ]))
+        run(self.root, "update")
+        out = run(self.root, "links", "plans/auth-plan.md")
+        self.assertIn("specs/auth-spec.md", out)
+
+
+class TestLinkAdd(VaultTest):
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def test_dry_run_writes_nothing(self):
+        before = (self.root / "notes/orphan-note.md").read_text(encoding="utf-8")
+        out = run(self.root, "link", "add", "notes/orphan-note.md", "auth-plan")
+        self.assertIn("dry run", out)
+        self.assertEqual(before, (self.root / "notes/orphan-note.md").read_text(encoding="utf-8"))
+
+    def test_apply_creates_related_section_then_idempotent(self):
+        run(self.root, "link", "add", "notes/orphan-note.md", "auth-plan", "--apply")
+        text = (self.root / "notes/orphan-note.md").read_text(encoding="utf-8")
+        self.assertTrue(text.endswith("## Related\n- [[auth-plan]]\n"), text)
+        self.assertIn("notes/orphan-note.md", run(self.root, "links", "plans/auth-plan.md"))
+        out = run(self.root, "link", "add", "notes/orphan-note.md", "auth-plan")
+        self.assertIn("already linked", out)
+        self.assertIn("nothing to add", out)
+        self.assertEqual(text, (self.root / "notes/orphan-note.md").read_text(encoding="utf-8"))
+
+    def test_reuses_existing_link_section(self):
+        write(self.root, "notes/hub.md", "\n".join([
+            "# hub", "", "본문 단락.", "",
+            "## 관련 문서", "- [[auth-plan]]", "",
+            "## 다른 섹션", "이 내용은 그대로 남아야 한다.",
+        ]))
+        run(self.root, "update")
+        run(self.root, "link", "add", "notes/hub.md", "auth-spec", "--apply")
+        lines = (self.root / "notes/hub.md").read_text(encoding="utf-8").splitlines()
+        sec = lines.index("## 관련 문서")
+        nxt = lines.index("## 다른 섹션")
+        self.assertIn("- [[auth-spec]]", lines[sec:nxt])
+        self.assertIn("이 내용은 그대로 남아야 한다.", lines[nxt:])
+
+    def test_multiple_targets_path_and_stem(self):
+        run(self.root, "link", "add", "notes/orphan-note.md",
+            "specs/auth-spec.md", "auth-plan", "--apply")
+        text = (self.root / "notes/orphan-note.md").read_text(encoding="utf-8")
+        self.assertIn("- [[auth-spec]]", text)
+        self.assertIn("- [[auth-plan]]", text)
+
+    def test_alias_target(self):
+        write(self.root, "profile/resume-ja.md", "\n".join([
+            "---", "aliases: [일본어 경력기술서]", "---", "# 職務経歴書", "", "本文.",
+        ]))
+        run(self.root, "update")
+        run(self.root, "link", "add", "notes/orphan-note.md", "일본어 경력기술서", "--apply")
+        self.assertIn("- [[resume-ja]]",
+                      (self.root / "notes/orphan-note.md").read_text(encoding="utf-8"))
+
+    def test_unknown_target_fails(self):
+        with self.assertRaises(AssertionError):
+            run(self.root, "link", "add", "notes/orphan-note.md", "no-such-doc")
+
+    def test_self_link_is_skipped(self):
+        out = run(self.root, "link", "add", "notes/orphan-note.md", "orphan-note", "--apply")
+        self.assertIn("nothing to add", out)
+
+
+class TestParserVersionRescan(VaultTest):
+    def test_stale_cache_is_fully_reparsed(self):
+        write(self.root, "profile/resume-ja.md", "\n".join([
+            "---", "aliases: [일본어 경력기술서]", "---", "# 職務経歴書", "", "本文.",
+        ]))
+        run(self.root, "update")
+        db = sqlite3.connect(self.root / ".wikimap" / "index.db")
+        db.execute("UPDATE meta SET value='0' WHERE key='parser_version'")
+        db.execute("DELETE FROM aliases")  # simulate a cache built by an older parser
+        db.commit()
+        db.close()
+        out = run(self.root, "update")
+        self.assertIn("(6 changed, 0 deleted)", out)
+        self.assertIn("profile/resume-ja.md", run(self.root, "search", "일본어 경력기술서"))
+
+
 if __name__ == "__main__":
     unittest.main()

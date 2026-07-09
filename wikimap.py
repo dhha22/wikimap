@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -47,14 +47,14 @@ MAP_DISABLED = "-"
 
 SKILL_TEMPLATE = r"""---
 name: wikimap
-description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain text, HTML, PDF, and images indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, and refreshing the index after creating or editing vault files.
+description: Zero-LLM incremental index + lazy semantic notes for a markdown knowledge base (wiki, Obsidian vault, spec folder; plain text, HTML, PDF, and images indexed too). Use when searching vault documents ("where is the X policy/spec?"), tracing links, backlinks, or requirement IDs across documents, suggesting or inserting links between related docs, moving/renaming vault files with reference rewriting, and refreshing the index after creating or editing vault files. Do not use for code symbol search in source repositories.
 ---
 
 # wikimap
 
 Index tool for a markdown knowledge base. Principle: **eager structure, lazy semantics** — builds are deterministic parsing only (zero LLM calls, sub-second), semantic knowledge accumulates at answer time.
 
-All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd>`
+All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when installed via pip)
 (`--root` optional when cwd is inside the vault — the `.wikimap/` directory is auto-detected upward)
 
 | Command | Purpose |
@@ -2317,25 +2317,67 @@ def install_hook(root: Path):
         pass
 
 
+AGENTS_MD_START = "<!-- wikimap:start -->"
+AGENTS_MD_END = "<!-- wikimap:end -->"
+AGENTS_MD_BLOCK = AGENTS_MD_START + """
+## wikimap — document index for this folder
+
+These docs are indexed by [wikimap](https://github.com/dhha22/wikimap) (zero-LLM, sub-second updates). Run commands as `wikimap <cmd>` (pip install) or `python3 ~/.agents/skills/wikimap/wikimap.py <cmd>`.
+
+- To answer a question about these docs: run `wikimap search "query"` first and read only the sections it returns — never sweep whole files. For fact/value questions, re-search with `-C 3` or `--full` to capture the value line. On 0 results or a `partial` marker, re-query once with synonyms or the other language before concluding it's absent.
+- After creating, editing, or deleting files here: run `wikimap update`.
+- After substantially editing a doc: `wikimap suggest --doc <path> -n 5 --wikilink`, verify the candidates, and paste only the genuine `[[links]]` into the doc body.
+- To bootstrap a link-less corpus: `wikimap suggest -n 0 --json`, judge pairs by their `dir` stratum (same directory first, then sibling; take far pairs only on high scores), then `wikimap link add <doc> <target> --apply`.
+- `search`, `links`, `path`, and `suggest` accept `--json` for structured output.
+""" + AGENTS_MD_END
+
+
+def install_agents_md(cwd):
+    p = cwd / "AGENTS.md"
+    if not p.exists():
+        p.write_text(AGENTS_MD_BLOCK + "\n", encoding="utf-8")
+        print(f"created {p} with the wikimap block")
+        return
+    text = p.read_text(encoding="utf-8")
+    if AGENTS_MD_START in text and AGENTS_MD_END in text:
+        pre, rest = text.split(AGENTS_MD_START, 1)
+        _, post = rest.split(AGENTS_MD_END, 1)
+        p.write_text(pre + AGENTS_MD_BLOCK + post, encoding="utf-8")
+        print(f"refreshed the wikimap block in {p} (rest of the file untouched)")
+    else:
+        sep = "" if text.endswith("\n\n") else "\n" if text.endswith("\n") else "\n\n"
+        p.write_text(text + sep + AGENTS_MD_BLOCK + "\n", encoding="utf-8")
+        print(f"appended the wikimap block to {p} (existing content untouched)")
+
+
 def cmd_install(args):
     if args.hook:
         install_hook(find_root(args.root))
         return
-    base = (Path.cwd() if args.project else Path.home()) / ".claude"
-    dest = base / "skills" / "wikimap"
-    dest.mkdir(parents=True, exist_ok=True)
+    if args.agents_md:
+        install_agents_md(Path.cwd())
+        return
+    base = Path.cwd() if args.project else Path.home()
+    skill_dirs = {
+        "claude": base / ".claude" / "skills" / "wikimap",
+        "agents": base / ".agents" / "skills" / "wikimap",
+    }
+    chosen = skill_dirs if args.target == "all" else {args.target: skill_dirs[args.target]}
     src = Path(__file__).resolve()
-    target = dest / "wikimap.py"
-    if src != target:
-        target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    skill = dest / "SKILL.md"
-    if skill.exists():
-        print(f"kept existing {skill} (customizations preserved)")
-    else:
-        skill.write_text(SKILL_TEMPLATE, encoding="utf-8")
-        print(f"wrote {skill}")
-    print(f"installed wikimap {VERSION} to {dest}")
-    print(f"next: cd <your-vault> && python3 {target} update")
+    for dest in chosen.values():
+        dest.mkdir(parents=True, exist_ok=True)
+        tool = dest / "wikimap.py"
+        if src != tool:
+            tool.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        skill = dest / "SKILL.md"
+        if skill.exists():
+            print(f"kept existing {skill} (customizations preserved)")
+        else:
+            skill.write_text(SKILL_TEMPLATE.replace("__WIKIMAP__", f"python3 {tool}"),
+                             encoding="utf-8")
+            print(f"wrote {skill}")
+        print(f"installed wikimap {VERSION} to {dest}")
+    print("next: cd <your-vault> && wikimap update")
 
 
 def main():
@@ -2351,8 +2393,16 @@ def main():
     ap.add_argument("--version", action="version", version=f"wikimap {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ins = sub.add_parser("install", help="install as a Claude Code skill (~/.claude/skills/wikimap)")
-    ins.add_argument("--project", action="store_true", help="install to ./.claude instead of ~/.claude")
+    ins = sub.add_parser("install", help="install as an agent skill (~/.claude/skills + ~/.agents/skills)")
+    ins.add_argument("--project", action="store_true",
+                     help="install to ./.claude and ./.agents instead of the home directory")
+    ins.add_argument("--target", choices=["claude", "agents", "all"], default="all",
+                     help="skill location: claude (~/.claude/skills, Claude Code), "
+                          "agents (~/.agents/skills, open agent-skills standard: Codex, Copilot, ...), "
+                          "or all (default)")
+    ins.add_argument("--agents-md", action="store_true",
+                     help="insert a wikimap usage block into ./AGENTS.md for tools without "
+                          "skill support (marker-delimited, idempotent, never touches other content)")
     ins.add_argument("--hook", action="store_true",
                      help="install a git post-commit hook in the vault repo that runs "
                           "wikimap update (appends to an existing hook, never replaces)")

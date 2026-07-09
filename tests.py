@@ -881,6 +881,85 @@ class TestInstallPreservesSkill(unittest.TestCase):
         self.assertEqual(copied, (site / "wikimap.py").read_text(encoding="utf-8"))
 
 
+class TestInstallMultiTarget(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = dict(os.environ, HOME=str(self.tmp), USERPROFILE=str(self.tmp))
+
+    def install(self, *extra):
+        r = subprocess.run(
+            [sys.executable, WIKIMAP, "install", *extra],
+            capture_output=True, text=True, encoding="utf-8", env=self.env, cwd=str(self.tmp),
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_default_installs_both_standard_locations(self):
+        self.install()
+        for base in (".claude", ".agents"):
+            d = self.tmp / base / "skills" / "wikimap"
+            self.assertTrue((d / "wikimap.py").exists(), base)
+            text = (d / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("name: wikimap", text)
+            self.assertNotIn("__WIKIMAP__", text, "command path placeholder must be substituted")
+            self.assertIn(str(d / "wikimap.py"), text)
+
+    def test_target_agents_only(self):
+        self.install("--target", "agents")
+        self.assertTrue((self.tmp / ".agents" / "skills" / "wikimap" / "SKILL.md").exists())
+        self.assertFalse((self.tmp / ".claude").exists())
+
+    def test_preservation_is_per_target(self):
+        claude_skill = self.tmp / ".claude" / "skills" / "wikimap" / "SKILL.md"
+        claude_skill.parent.mkdir(parents=True)
+        custom = "# my customized SKILL.md\n"
+        claude_skill.write_text(custom, encoding="utf-8")
+        out = self.install()
+        self.assertIn("kept existing", out)
+        self.assertEqual(claude_skill.read_text(encoding="utf-8"), custom)
+        agents_skill = self.tmp / ".agents" / "skills" / "wikimap" / "SKILL.md"
+        self.assertIn("name: wikimap", agents_skill.read_text(encoding="utf-8"))
+
+    def test_project_installs_under_cwd(self):
+        self.install("--project")
+        self.assertTrue((self.tmp / ".claude" / "skills" / "wikimap" / "SKILL.md").exists())
+        self.assertTrue((self.tmp / ".agents" / "skills" / "wikimap" / "SKILL.md").exists())
+
+
+class TestInstallAgentsMd(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wikimap-agentsmd-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def install_agents_md(self):
+        r = subprocess.run(
+            [sys.executable, WIKIMAP, "install", "--agents-md"],
+            capture_output=True, text=True, encoding="utf-8", cwd=str(self.tmp),
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return (self.tmp / "AGENTS.md").read_text(encoding="utf-8")
+
+    def test_creates_when_missing(self):
+        text = self.install_agents_md()
+        self.assertIn("<!-- wikimap:start -->", text)
+        self.assertIn("wikimap search", text)
+
+    def test_appends_preserving_existing_content(self):
+        (self.tmp / "AGENTS.md").write_text("# my project rules\n\nkeep me\n", encoding="utf-8")
+        text = self.install_agents_md()
+        self.assertIn("keep me", text)
+        self.assertTrue(text.index("keep me") < text.index("<!-- wikimap:start -->"))
+
+    def test_rerun_refreshes_block_without_duplication(self):
+        (self.tmp / "AGENTS.md").write_text("before\n", encoding="utf-8")
+        first = self.install_agents_md()
+        second = self.install_agents_md()
+        self.assertEqual(first, second)
+        self.assertEqual(second.count("<!-- wikimap:start -->"), 1)
+        self.assertIn("before", second)
+
+
 class TestAliases(VaultTest):
     def setUp(self):
         super().setUp()

@@ -350,6 +350,59 @@ class TestSuggestWikilink(VaultTest):
         self.assertNotIn("edge add --src", out.splitlines()[0])
 
 
+class TestSuggestProximity(VaultTest):
+    def suggest_pairs(self, *cmd):
+        out = json.loads(run(self.root, "suggest", "-n", "0", "--json", *cmd))
+        return {tuple(sorted((c["a"], c["b"]))): c for c in out["candidates"]}
+
+    def test_same_dir_pair_enumerated_without_shared_terms(self):
+        write(self.root, "policy/feed/feed-list-policy.md", "# 리스트 정책\n\n스크롤 페이징 zxqaaa")
+        write(self.root, "policy/feed/feed-detail-policy.md", "# 상세 정책\n\n댓글 노출 zxqbbb")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        key = ("policy/feed/feed-detail-policy.md", "policy/feed/feed-list-policy.md")
+        self.assertIn(key, pairs)
+        self.assertEqual(pairs[key]["dir"], "same")
+        self.assertIn("dir:same", pairs[key]["signals"])
+
+    def test_name_token_overlap_outranks_bare_same_dir(self):
+        write(self.root, "policy/feed/feed-list-logging-policy.md", "# a\n\nzxqccc")
+        write(self.root, "policy/feed/feed-detail-logging-policy.md", "# b\n\nzxqddd")
+        write(self.root, "policy/feed/unrelated-thing.md", "# c\n\nzxqeee")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        logging_pair = pairs[("policy/feed/feed-detail-logging-policy.md",
+                             "policy/feed/feed-list-logging-policy.md")]
+        bare_pair = pairs[("policy/feed/feed-list-logging-policy.md",
+                          "policy/feed/unrelated-thing.md")]
+        self.assertGreater(logging_pair["score"], bare_pair["score"])
+        self.assertTrue(any(s.startswith("name:") for s in logging_pair["signals"]))
+
+    def test_sibling_dir_pair_enumerated(self):
+        write(self.root, "policy/feed/feed-list-policy.md", "# a\n\nzxqfff")
+        write(self.root, "policy/comment/comment-state-policy.md", "# b\n\nzxqggg")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        key = ("policy/comment/comment-state-policy.md", "policy/feed/feed-list-policy.md")
+        self.assertIn(key, pairs)
+        self.assertEqual(pairs[key]["dir"], "sibling")
+
+    def test_linked_same_dir_pair_excluded(self):
+        write(self.root, "policy/feed/feed-list-policy.md", "# a\n\n[[feed-detail-policy]] zxqhhh")
+        write(self.root, "policy/feed/feed-detail-policy.md", "# b\n\nzxqiii")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        self.assertNotIn(("policy/feed/feed-detail-policy.md", "policy/feed/feed-list-policy.md"),
+                         pairs)
+
+    def test_images_not_enumerated(self):
+        write(self.root, "assets/diagram.png", "fake png bytes")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        for a, b in pairs:
+            self.assertFalse(a.endswith(".png") or b.endswith(".png"))
+
+
 class TestSemanticsFileSSOT(VaultTest):
     def setUp(self):
         super().setUp()

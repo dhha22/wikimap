@@ -16,6 +16,7 @@ import difflib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -27,7 +28,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -64,7 +65,7 @@ All commands: `python3 ~/.claude/skills/wikimap/wikimap.py [--root <vault>] <cmd
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
-| `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs — no LLM); `-n 0` = no cap (bootstrap sweeps); `--wikilink` prints paste-ready `[[links]]` for the doc body |
+| `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs, directory proximity, filename-token overlap — no LLM); same-directory and sibling-directory pairs are always candidates even with no shared content; JSON rows carry `dir: same\|sibling\|far`; `-n 0` = no cap (bootstrap sweeps); `--wikilink` prints paste-ready `[[links]]` for the doc body |
 | `link add <doc> <target>... [--section H] [--apply]` | insert `- [[target]]` items into the doc's link-list section (reuses an existing Related/See also/관련 문서 section, else creates `## Related`). Idempotent — an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run without `--apply` |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
 | `edge repin --src a.md --dst b.md` | after reviewing both ends of a stale edge: refresh the sha pins, keep the rationale |
@@ -88,7 +89,7 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 5. **After creating or substantially editing a doc**: run `suggest --doc <path> -n 5 --wikilink`, read the candidates' relevant sections, and paste only the genuinely related `[[links]]` into the doc body (a "Related" line is fine) — explicit links are readable by every vault tool and survive re-indexing. Use `edge add` only when you can't edit the doc. Requirement IDs are per-document local numbers — a match across unrelated projects is a false signal; discard it.
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 7. **A stale edge whose connection still holds**: if it went stale only because an endpoint was edited, review both docs and run `edge repin --src a --dst b` — the rationale is kept, only the sha pins refresh. Re-add only when the relationship itself changed.
-8. **Bootstrapping a link-less corpus** (docs with no links between them): ① `suggest -n 0 --json` for the full candidate list. ② Judge each pair from its titles, headings, and the shared signals only — do not read whole files; the cost cap is the point. ③ Apply the genuine ones with `link add <doc> <target> --apply` (batch several targets per doc). Judge honestly: shared rare terms across unrelated projects (or matching REQ-IDs from different specs) are false signals — reject them.
+8. **Bootstrapping a link-less corpus** (docs with no links between them): ① `suggest -n 0 --json` for the full candidate list. ② Judge each pair from its titles, headings, and the shared signals only — do not read whole files; the cost cap is the point. Work through candidates by `dir` stratum: `same` first, then `sibling`, and take `far` pairs only when their score is high — measured precision drops an order of magnitude from same-directory to far pairs. ③ Apply the genuine ones with `link add <doc> <target> --apply` (batch several targets per doc). Judge honestly: shared rare terms across unrelated projects (or matching REQ-IDs from different specs) are false signals — reject them.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -1134,11 +1135,32 @@ def cmd_import_graphify(root, db, args):
 TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9_]{2,}")
 
 
+NAME_STOP = {"policy", "spec", "plan", "tc", "notes", "review", "test", "guide", "index", "readme"}
+
+
+def name_tokens(path):
+    return {t.lower() for t in re.split(r"[-_ .]", Path(path).stem)
+            if len(t) >= 2 and t.lower() not in NAME_STOP}
+
+
+def dir_proximity(a, b):
+    pa, pb = Path(a).parent, Path(b).parent
+    if pa == pb:
+        return "same"
+    if pa.parent == pb.parent:
+        return "sibling"
+    return "far"
+
+
 def cmd_suggest(root, db, args):
-    docs = {p: t for p, t in db.execute("SELECT path, title FROM files")}
+    prose_exts = {".md", ".pdf"} | PLAIN_EXTS | HTML_EXTS
+    docs = {p: t for p, t in db.execute("SELECT path, title FROM files")
+            if Path(p).suffix.lower() in prose_exts}
     doc_terms = {p: {} for p in docs}
     for path, heading, content in db.execute("SELECT path, heading, content FROM sections"):
-        tw = doc_terms.setdefault(path, {})
+        if path not in doc_terms:
+            continue
+        tw = doc_terms[path]
         for tok in TOKEN.findall(heading):
             tw[tok.lower()] = 2
         cnt = {}
@@ -1201,14 +1223,48 @@ def cmd_suggest(root, db, args):
             for j in range(i + 1, len(ds)):
                 bump(ds[i], ds[j], 3 if kind == "req" else 2, ref)
 
-    for key in scores:
-        if Path(key[0]).parts[:2] != Path(key[1]).parts[:2]:
-            scores[key] *= 1.3
+    by_parent = {}
+    for p in docs:
+        if Path(p).suffix.lower() != ".pdf":
+            by_parent.setdefault(str(Path(p).parent.parent), []).append(p)
+    for group in by_parent.values():
+        group = sorted(group)
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                if dir_proximity(a, b) == "far":
+                    continue
+                key = (a, b)
+                if key in linked or (doc_filter and doc_filter not in key):
+                    continue
+                scores.setdefault(key, 0.0)
+                why.setdefault(key, [])
+
+    ntoks = {p: name_tokens(p) for p in docs}
+    ndf = {}
+    for ts in ntoks.values():
+        for t in ts:
+            ndf[t] = ndf.get(t, 0) + 1
+    ndocs = len(docs) or 1
+    for key, s in scores.items():
+        a, b = key
+        prox = dir_proximity(a, b)
+        s += 4.0 if prox == "same" else 2.0 if prox == "sibling" else 0.0
+        shared = ntoks.get(a, set()) & ntoks.get(b, set())
+        s += 1.5 * sum(math.log(ndocs / ndf[t]) for t in shared)
+        scores[key] = s
+        w = why[key]
+        for t in sorted(shared, key=lambda t: ndf[t])[:2]:
+            if len(w) < 8:
+                w.append(f"name:{t}")
+        if prox != "far" and len(w) < 8:
+            w.append(f"dir:{prox}")
 
     top = sorted(scores.items(), key=lambda x: -x[1])[: args.n or None]
     if args.json:
         print(json.dumps({"doc": doc_filter, "candidates": [
-            {"a": a, "b": b, "score": round(s, 2), "signals": why[(a, b)][:6]}
+            {"a": a, "b": b, "score": round(s, 2), "dir": dir_proximity(a, b),
+             "signals": why[(a, b)][:6]}
             for (a, b), s in top
         ]}, ensure_ascii=False, indent=2))
         return

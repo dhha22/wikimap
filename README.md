@@ -23,14 +23,15 @@ The LLM cost is proportional to **what you actually asked**, never to corpus siz
 
 ## Measured vs graphify (262-doc Korean/English vault, M-series Mac)
 
-<sub>Build/update/determinism figures below are from wikimap 0.4.0; search quality has since improved substantially — see the v5 benchmark further down.</sub>
+<sub>The wikimap column is **measured on 0.13.0** (270-doc link-stripped Korean/English corpus, M-series Mac, median of 3–5 runs per row). The graphify column is from actually running graphify on the original 262-doc vault — the doc counts differ slightly but the scale is comparable, and the point is the order-of-magnitude gap, not the absolute numbers.</sub>
 
-| Operation | wikimap | graphify (same vault, same change set) |
+| Operation | wikimap 0.13.0 | graphify (comparable vault, same change set) |
 |---|---|---|
-| Full index build | 0.5 s, $0 | minutes + LLM extraction cost |
-| Update after editing 1 doc + adding 1 + deleting 1 | **0.1 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
-| Update after index drifted for days | still sub-second (sha-diff) | re-detected 287 of 306 files as changed → near-full re-extraction |
-| Search recall@5 (10 mixed Korean/English queries) | **10/10**, ~60 ms | 5/10 start-node matches — default query filter drops terms shorter than 4 chars, so every short Korean term is discarded |
+| Full index build | **0.28 s, $0** (indexing 0.22 s) | minutes + LLM extraction cost |
+| Update after editing 1 doc + adding 1 + deleting 1 | **0.07 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
+| Update after index drifted for days | still sub-second (sha-diff, no-op 0.07 s) | re-detected 287 of 306 files as changed → near-full re-extraction |
+| Link-candidate generation (all 270 docs) | **0.32 s, 0 tokens** (7,438 pairs) | graph build 314 s + 2.41M tokens |
+| Search latency (word query) | ~**0.1 s** | start-node match, then you re-read the source files |
 | Search output | section + line number + matched snippet | entity labels; you still re-read the source files |
 | Deleted file cleanup | automatic, verified | 9.7% of source files in the graph were ghosts (already deleted); 40 duplicate node labels |
 | Determinism | same input → byte-identical index | non-deterministic graphs from identical inputs ([upstream #1695](https://github.com/Graphify-Labs/graphify/issues/1695)) |

@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -66,7 +66,9 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
 | `notes [--all] [--prune]` | list notes / prune stale ones |
 | `suggest [--doc path] [-n 10] [--wikilink]` | heuristic candidates for unwritten doc connections (shared rare terms, requirement IDs, code refs, directory proximity, filename-token overlap — no LLM); same-directory and sibling-directory pairs are always candidates even with no shared content; JSON rows carry `dir: same\|sibling\|far`; `-n 0` = no cap (bootstrap sweeps); `--wikilink` prints paste-ready `[[links]]` for the doc body |
-| `link add <doc> <target>... [--section H] [--apply]` | insert `- [[target]]` items into the doc's link-list section (reuses an existing Related/See also/관련 문서 section, else creates `## Related`). Idempotent — an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run without `--apply` |
+| `link add <doc> <target>... [--section H] [--apply]` | insert `- [[target]]` items into the doc's link-list section (reuses an existing Related/See also section, or one named with `--section` in any language, else creates `## Related`). Idempotent — an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run without `--apply` |
+| `embed set <doc> --vector <json>\|--stdin` / `embed status` | store an agent-generated embedding vector for a doc (pinned to its content sha — auto-stale when the file changes), or report coverage + which docs need (re)embedding. wikimap stores and searches vectors; the *agent* generates them — no build-time LLM, no bundled model |
+| `semsearch --vector <json>\|--stdin [-n 10]` | cosine-rank docs by an agent-supplied query embedding (language-agnostic semantic search; only fresh embeddings whose sha still matches are ranked) |
 | `edge add --src a.md --dst b.md --relation ... --rationale "..."` | confirm a connection (both shas pinned; goes stale if either file changes) |
 | `edge repin --src a.md --dst b.md` | after reviewing both ends of a stale edge: refresh the sha pins, keep the rationale |
 | `edges [--all] [--prune]` | list inferred connections |
@@ -75,14 +77,14 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `mv <old> <new> [--apply]` | move/rename a doc AND rewrite every wikilink/md/img reference to it (dry run without `--apply`); semantics.jsonl paths updated too |
 | `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied) |
 
-`search`/`links`/`path`/`suggest`/`notes`/`edges` accept `--json` for structured output — prefer it when a script consumes the result.
+`search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the result set is empty, fell back to a partial match, or has a low top score — the signal to try the semantic path (see rule 9).
 
 Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable — the source of truth); `.wikimap/index.db` is a disposable cache rebuilt from files + that jsonl.
 
 ## Rules for the agent
 
 1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files. For fact/value questions ("what is the limit/period/owner?"), retry with `-C 3` or `--full` before falling back to Read.
-   **Re-query before giving up**: on 0 results or a `partial` marker, re-search once with reformulated terms — synonyms, the concept behind the phrase, or the other language (Korean↔English) — before concluding the vault lacks it. The index is deterministic; the reformulation is your job.
+   **Re-query before giving up**: on 0 results, a `partial` marker, or `weak: true`, re-search once with reformulated terms — synonyms, the concept behind the phrase, or the other language (Korean↔English) — before concluding the vault lacks it. The index is deterministic; the reformulation is your job. If reformulation still comes up weak and an embedding index exists (`embed status`), fall to the semantic path (rule 9).
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
@@ -90,6 +92,7 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 6. **Trust tags in `links` output**: `[linked|…]` means a human wrote that connection in the source text; `[inferred|…]` means it was guessed and then confirmed (sha-verified). Weight answers accordingly.
 7. **A stale edge whose connection still holds**: if it went stale only because an endpoint was edited, review both docs and run `edge repin --src a --dst b` — the rationale is kept, only the sha pins refresh. Re-add only when the relationship itself changed.
 8. **Bootstrapping a link-less corpus** (docs with no links between them): ① `suggest -n 0 --json` for the full candidate list. ② Judge each pair from its titles, headings, and the shared signals only — do not read whole files; the cost cap is the point. Work through candidates by `dir` stratum: `same` first, then `sibling`, and take `far` pairs only when their score is high — measured precision drops an order of magnitude from same-directory to far pairs. ③ Apply the genuine ones with `link add <doc> <target> --apply` (batch several targets per doc). Judge honestly: shared rare terms across unrelated projects (or matching REQ-IDs from different specs) are false signals — reject them.
+9. **Semantic search for natural-language questions** (the language-agnostic path, when keyword search comes up `weak` and reformulation doesn't help): keyword matching is substring-based, so a conversational question that shares no exact terms with the doc ("how is the impression flag reset?" vs a doc titled "노출 트래킹") won't match by keyword in any language. If an embedding index exists, generate a query embedding **yourself** (any embedding model — wikimap is model-agnostic) and run `semsearch --vector <json>`. To make docs searchable this way, embed them once: for each doc `embed set <path> --vector <json>` with a vector you generate; `embed status` shows what's missing or stale. wikimap only stores and cosine-ranks — the vectors, and the cost, are yours and scale with what you embed, not with build time.
 """
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
@@ -157,6 +160,7 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_aliases_path ON aliases(path);
         CREATE TABLE IF NOT EXISTS img_alts(src TEXT, dst TEXT, alt TEXT);
         CREATE INDEX IF NOT EXISTS idx_img_alts_src ON img_alts(src);
+        CREATE TABLE IF NOT EXISTS embeds(path TEXT PRIMARY KEY, sha TEXT, vec TEXT);
         """
     )
     try:
@@ -996,7 +1000,7 @@ def load_semantics(root: Path):
             r = json.loads(ln)
         except ValueError:
             continue  # a hand-edited bad line must not take the whole layer down
-        if isinstance(r, dict) and r.get("type") in ("note", "edge"):
+        if isinstance(r, dict) and r.get("type") in ("note", "edge", "embed"):
             recs.append(r)
     return recs
 
@@ -1006,7 +1010,12 @@ def compact_semantics(recs):
     out, seen = [], set()
     for r in reversed(recs):
         if r["type"] == "edge":
-            key = (r.get("src"), r.get("dst"), r.get("relation"))
+            key = ("edge", r.get("src"), r.get("dst"), r.get("relation"))
+            if key in seen:
+                continue
+            seen.add(key)
+        elif r["type"] == "embed":
+            key = ("embed", r.get("path"))
             if key in seen:
                 continue
             seen.add(key)
@@ -1061,12 +1070,19 @@ def sync_semantics(root: Path, db):
         return
     db.execute("DELETE FROM notes")
     db.execute("DELETE FROM edges")
+    db.execute("DELETE FROM embeds")
     for r in compact_semantics(load_semantics(root)):
         if r["type"] == "note":
             db.execute(
                 "INSERT INTO notes(question, insight, created, sources) VALUES(?,?,?,?)",
                 (r.get("question", ""), r.get("insight", ""), r.get("created", ""),
                  json.dumps(r.get("sources", []), ensure_ascii=False)),
+            )
+        elif r["type"] == "embed":
+            db.execute(
+                "INSERT OR REPLACE INTO embeds(path, sha, vec) VALUES(?,?,?)",
+                (r.get("path"), r.get("sha"),
+                 json.dumps(r.get("vec", []), ensure_ascii=False)),
             )
         else:
             db.execute(
@@ -1135,12 +1151,20 @@ def cmd_import_graphify(root, db, args):
 TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9_]{2,}")
 
 
-NAME_STOP = {"policy", "spec", "plan", "tc", "notes", "review", "test", "guide", "index", "readme"}
-
-
 def name_tokens(path):
-    return {t.lower() for t in re.split(r"[-_ .]", Path(path).stem)
-            if len(t) >= 2 and t.lower() not in NAME_STOP}
+    return {t.lower() for t in re.split(r"[-_ .]", Path(path).stem) if len(t) >= 2}
+
+
+def structure_words(paths, ratio=0.06):
+    """Filename tokens common enough to be this vault's structure vocabulary
+    (e.g. 'policy', '정책', 'spec') rather than content. Derived from the corpus,
+    not hardcoded — every vault has different conventions."""
+    df = {}
+    for p in paths:
+        for t in name_tokens(p):
+            df[t] = df.get(t, 0) + 1
+    cutoff = max(2, len(paths) * ratio)
+    return {t for t, c in df.items() if c >= cutoff}
 
 
 def dir_proximity(a, b):
@@ -1707,6 +1731,7 @@ def candidate_paths(db, terms, titles, doc_aliases):
 
 QUERY_TOKEN = re.compile(r'(?:(title|path|heading|tag|type):)?(?:"([^"]+)"|([^\s"]+))')
 FIELD_WEIGHT = {"title": 8, "path": 6, "heading": 5, "tag": 7, "type": 3}
+WEAK_SCORE = 10
 TYPE_EXTS = {
     "md": {".md"},
     "html": HTML_EXTS,
@@ -1830,6 +1855,11 @@ def cmd_search(root, db, args):
         partial = True
 
     results.sort(key=lambda r: (-r[0], -r[1]))
+    # a weak result set (empty, partial-fallback, or a low top score) is the signal
+    # for an agent to generate a query embedding and retry with `semsearch` — the
+    # semantic half of the re-query loop. Keyword search stays the fast $0 default.
+    top_score = results[0][1] if results else 0
+    weak = (not results) or partial or top_score < WEAK_SCORE
     if args.json:
         out = []
         for matched, score, path, line, heading, content in results[: args.n]:
@@ -1843,7 +1873,7 @@ def cmd_search(root, db, args):
                 rec["content"] = content
             out.append(rec)
         print(json.dumps({"query": args.query, "notes": matched_notes,
-                          "partial": partial, "results": out},
+                          "partial": partial, "weak": weak, "results": out},
                          ensure_ascii=False, indent=2))
         return
     if not results and not matched_notes:
@@ -2002,6 +2032,104 @@ def cmd_path(root, db, args):
     print(f"({len(chain) - 1} hops)")
 
 
+def cosine(a, b):
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def doc_sha(db, path):
+    row = db.execute("SELECT sha FROM files WHERE path=?", (path,)).fetchone()
+    return row[0] if row else None
+
+
+def cmd_embed(root, db, args):
+    if args.action == "set":
+        path = norm_rel(args.doc)
+        sha = doc_sha(db, path)
+        if sha is None:
+            sys.exit(f"not in index (run update first?): {path}")
+        raw = sys.stdin.read() if args.stdin else args.vector
+        if not raw:
+            sys.exit("no vector given (use --vector <json> or --stdin)")
+        try:
+            vec = json.loads(raw)
+        except ValueError:
+            sys.exit("vector must be a JSON array of numbers")
+        if not isinstance(vec, list) or not all(isinstance(x, (int, float)) for x in vec):
+            sys.exit("vector must be a JSON array of numbers")
+        append_semantics(root, {"type": "embed", "path": path, "sha": sha, "vec": vec})
+        db.execute("INSERT OR REPLACE INTO embeds(path, sha, vec) VALUES(?,?,?)",
+                   (path, sha, json.dumps(vec, ensure_ascii=False)))
+        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('semantics_sha', ?)",
+                   (hashlib.sha256(semantics_path(root).read_bytes()).hexdigest(),))
+        db.commit()
+        print(f"stored embedding for {path} ({len(vec)} dims)")
+        return
+
+    # status: coverage + which docs need (re)embedding
+    files = {p: s for p, s in db.execute("SELECT path, sha FROM files")}
+    embeds = {p: (s, v) for p, s, v in db.execute("SELECT path, sha, vec FROM embeds")}
+    dim = None
+    for _, v in embeds.values():
+        arr = json.loads(v)
+        if arr:
+            dim = len(arr)
+            break
+    fresh = [p for p, (s, _) in embeds.items() if files.get(p) == s]
+    stale = [p for p, (s, _) in embeds.items() if p in files and files[p] != s]
+    missing = [p for p in files if p not in embeds]
+    if args.json:
+        print(json.dumps({"total_docs": len(files), "embedded": len(fresh),
+                          "stale": stale, "missing": missing, "dims": dim},
+                         ensure_ascii=False, indent=2))
+        return
+    print(f"embedded: {len(fresh)}/{len(files)} docs" + (f" ({dim} dims)" if dim else ""))
+    if stale:
+        print(f"stale (re-embed {len(stale)}): " + ", ".join(stale[:10])
+              + (" ..." if len(stale) > 10 else ""))
+    if missing:
+        print(f"missing ({len(missing)}): " + ", ".join(missing[:10])
+              + (" ..." if len(missing) > 10 else ""))
+
+
+def semantic_hits(db, qvec, limit):
+    """Cosine rank of fresh embeddings (sha matches the current file)."""
+    files = {p: s for p, s in db.execute("SELECT path, sha FROM files")}
+    scored = []
+    for path, sha, vec in db.execute("SELECT path, sha, vec FROM embeds"):
+        if files.get(path) != sha:
+            continue
+        arr = json.loads(vec)
+        if len(arr) != len(qvec):
+            continue
+        scored.append((cosine(qvec, arr), path))
+    scored.sort(reverse=True)
+    return scored[:limit]
+
+
+def cmd_semsearch(root, db, args):
+    try:
+        qvec = json.loads(sys.stdin.read() if args.stdin else args.vector)
+    except (ValueError, TypeError):
+        sys.exit("query vector must be a JSON array (use --vector <json> or --stdin)")
+    hits = semantic_hits(db, qvec, args.n)
+    if args.json:
+        print(json.dumps({"results": [{"path": p, "cosine": round(c, 4)} for c, p in hits]},
+                         ensure_ascii=False, indent=2))
+        return
+    if not hits:
+        print("no embeddings match (run embed set first, or check vector dims)")
+        return
+    for c, p in hits:
+        print(f"{c:.4f}  {p}")
+
+
 def cmd_note_add(root, db, args):
     sources = []
     for p in args.sources.split(","):
@@ -2047,8 +2175,9 @@ def cmd_notes(root, db, args):
 MDURL = re.compile(r"\]\(([^)#\s]+)\)")
 
 
-RELATED_HEADINGS = {"related", "related pages", "related docs", "see also", "links",
-                    "관련 문서", "관련 페이지"}
+# English standards only — language-specific conventions (관련 문서, 関連, 相关…) would
+# bake one locale into a tool meant for everyone. For any other heading, pass --section.
+RELATED_HEADINGS = {"related", "related pages", "related docs", "see also"}
 
 
 def cmd_link_add(root, db, args):
@@ -2445,8 +2574,8 @@ def main():
     lk.add_argument("doc", help="vault-relative markdown doc to edit")
     lk.add_argument("targets", nargs="+", help="link targets (stem, alias, or vault-relative path)")
     lk.add_argument("--section", default=None,
-                    help="heading of the list section to use (default: reuse an existing "
-                         "Related/See also/관련 문서 style section, else create '## Related')")
+                    help="heading of the list section to use, in any language (default: "
+                         "reuse an existing Related/See also section, else create '## Related')")
     lk.add_argument("--apply", action="store_true", help="actually write (default: dry run)")
 
     pp = sub.add_parser("path", help="shortest link path between two docs (BFS over links + fresh edges)")
@@ -2475,6 +2604,20 @@ def main():
     sg.add_argument("--wikilink", action="store_true",
                     help="print candidates as paste-ready [[wikilinks]] for the doc body")
     sg.add_argument("--json", action="store_true", help="structured output for agents/scripts")
+
+    em = sub.add_parser("embed", help="store/inspect agent-supplied embedding vectors "
+                                      "(wikimap stores and searches; the agent generates)")
+    em.add_argument("action", choices=["set", "status"])
+    em.add_argument("doc", nargs="?", help="vault-relative path (for set)")
+    em.add_argument("--vector", help="embedding as a JSON array of numbers (for set)")
+    em.add_argument("--stdin", action="store_true", help="read the JSON vector from stdin")
+    em.add_argument("--json", action="store_true", help="structured output for agents/scripts")
+
+    ss = sub.add_parser("semsearch", help="cosine-rank docs by an agent-supplied query vector")
+    ss.add_argument("--vector", help="query embedding as a JSON array of numbers")
+    ss.add_argument("--stdin", action="store_true", help="read the JSON query vector from stdin")
+    ss.add_argument("-n", type=int, default=10, help="max results")
+    ss.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
     ea = sub.add_parser("edge", help="confirm or repin an inferred connection (sha-pinned both ends)")
     ea.add_argument("action", choices=["add", "repin"],
@@ -2524,6 +2667,10 @@ def main():
             cmd_notes(root, db, args)
         elif args.cmd == "import-graphify":
             cmd_import_graphify(root, db, args)
+        elif args.cmd == "embed":
+            cmd_embed(root, db, args)
+        elif args.cmd == "semsearch":
+            cmd_semsearch(root, db, args)
         elif args.cmd == "suggest":
             cmd_suggest(root, db, args)
         elif args.cmd == "edge":

@@ -1022,15 +1022,31 @@ class TestLinkAdd(VaultTest):
         self.assertIn("nothing to add", out)
         self.assertEqual(text, (self.root / "notes/orphan-note.md").read_text(encoding="utf-8"))
 
-    def test_reuses_existing_link_section(self):
+    def test_reuses_existing_english_link_section(self):
         write(self.root, "notes/hub.md", "\n".join([
             "# hub", "", "본문 단락.", "",
-            "## 관련 문서", "- [[auth-plan]]", "",
+            "## See Also", "- [[auth-plan]]", "",
             "## 다른 섹션", "이 내용은 그대로 남아야 한다.",
         ]))
         run(self.root, "update")
         run(self.root, "link", "add", "notes/hub.md", "auth-spec", "--apply")
         lines = (self.root / "notes/hub.md").read_text(encoding="utf-8").splitlines()
+        sec = lines.index("## See Also")
+        nxt = lines.index("## 다른 섹션")
+        self.assertIn("- [[auth-spec]]", lines[sec:nxt])
+        self.assertIn("이 내용은 그대로 남아야 한다.", lines[nxt:])
+
+    def test_reuses_named_section_any_language(self):
+        # non-English section headings work via explicit --section (no locale baked in)
+        write(self.root, "notes/hub2.md", "\n".join([
+            "# hub", "", "본문 단락.", "",
+            "## 관련 문서", "- [[auth-plan]]", "",
+            "## 다른 섹션", "이 내용은 그대로 남아야 한다.",
+        ]))
+        run(self.root, "update")
+        run(self.root, "link", "add", "notes/hub2.md", "auth-spec",
+            "--section", "관련 문서", "--apply")
+        lines = (self.root / "notes/hub2.md").read_text(encoding="utf-8").splitlines()
         sec = lines.index("## 관련 문서")
         nxt = lines.index("## 다른 섹션")
         self.assertIn("- [[auth-spec]]", lines[sec:nxt])

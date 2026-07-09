@@ -21,7 +21,9 @@ wikimap inverts the design: **eager structure, lazy semantics.**
 
 The LLM cost is proportional to **what you actually asked**, never to corpus size.
 
-## Measured (262-doc Korean/English vault, M-series Mac, wikimap 0.4.0)
+## Measured vs graphify (262-doc Korean/English vault, M-series Mac)
+
+<sub>Build/update/determinism figures below are from wikimap 0.4.0; search quality has since improved substantially — see the v5 benchmark further down.</sub>
 
 | Operation | wikimap | graphify (same vault, same change set) |
 |---|---|---|
@@ -47,10 +49,10 @@ xychart-beta
     x-axis ["recall@1", "recall@3", "recall@5", "recall@10", "MRR"]
     y-axis "score" 0 --> 1
     bar [0.507, 0.761, 0.789, 0.803, 0.627]
-    bar [0.183, 0.394, 0.563, 0.690, 0.338]
+    line [0.183, 0.394, 0.563, 0.690, 0.338]
 ```
 
-<sub>■ front bars = **wikimap 0.13.0** · ■ back bars = graphify (v1 graph, BFS)</sub>
+<sub>bars = **wikimap 0.13.0** · line = graphify (v1 graph, BFS) — full numbers in the table below</sub>
 
 | Metric | wikimap 0.13.0 | graphify | wikimap advantage |
 |---|---|---|---|
@@ -113,7 +115,7 @@ Every result is a file, a line number, and the matched lines — your agent jump
 | Command | What it does |
 |---|---|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first. Prints coverage — indexed vs skipped counts by extension, so nothing is dropped silently. `MAP.md` ends with a Health section: orphan docs, broken links, stale semantics. Excludes: `.wikimapignore` at the vault root (one dir/glob per line, persistent) or `--ignore` (this run only). `--map-path`/`--no-map` relocate or disable the generated map — persisted in the index |
-| `search "query" [-n 8] [-C 3 \| --full]` | Ranked section search — filename, title, and heading matches boosted; FTS5-accelerated on vaults ≥500 docs. Exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first. Query syntax: `"exact phrase"`, `title:` / `path:` / `heading:` / `tag:` field filters (frontmatter `tags: [a, b]` are indexed and summarized in the map), and `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR marked `partial k/n` — never mixed with full matches; field filters stay hard |
+| `search "query" [-n 8] [-C 3 \| --full] [--hybrid <vec>\|-]` | Ranked section search — filename, title, and heading matches boosted; FTS5-accelerated on vaults ≥500 docs. Exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first. Query syntax: `"exact phrase"`, `title:` / `path:` / `heading:` / `tag:` field filters (frontmatter `tags: [a, b]` are indexed and summarized in the map), and `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. Long conversational queries are gated by matched-term idf (function words drop out by corpus frequency) and rolled up per document; when no section matches every term, results relax to a majority-of-terms OR marked `partial k/n` — never mixed with full matches; field filters stay hard. `--hybrid` folds an agent-supplied query embedding into the keyword ranking in one call (JSON array, or `-`/omitted to read stdin) — docs found by both signals float up, semantic-only docs splice in |
 | `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID. Trust tags on every entry: `[linked\|…]` = a human wrote it in the source, `[inferred\|…]` = guessed then confirmed, sha-verified |
 | `path <a> <b>` | Shortest connection path between two docs — BFS over wiki/markdown links (both directions) plus fresh inferred edges |
 | `note add` | Save an answer-time insight, pinned to source content hashes |
@@ -130,7 +132,7 @@ Every result is a file, a line number, and the matched lines — your agent jump
 | `mv <old> <new> [--apply]` | Move/rename a doc and rewrite every wikilink, markdown, and image reference to it — including the moved file's own relative links and `semantics.jsonl` paths (content hash unchanged, so pinned semantics stay fresh). Dry run unless `--apply` |
 | `fix-links [--json]` | For each broken link the Health section counts: suggest close-match targets. Suggestions only — nothing is auto-applied |
 
-`search`, `links`, `path`, `suggest`, `notes`, `edges`, and `semsearch` all take **`--json`** — structured output for agents and scripts, no regex-scraping of human output. `search --json` sets `weak: true` when results are empty, partial, or low-scoring — the cue for an agent to reformulate or fall to the semantic path. Schemas are stable and covered by the test suite.
+`search`, `links`, `path`, `suggest`, `notes`, `edges`, and `semsearch` all take **`--json`** — structured output for agents and scripts, no regex-scraping of human output. `search --json` sets `weak: true` when results are empty, partial, or low-scoring — the cue for an agent to reformulate the query in document vocabulary, or fold in an on-demand embedding via `search --hybrid` / `semsearch`. Schemas are stable and covered by the test suite.
 
 ## How inferred connections work without eager LLM extraction
 

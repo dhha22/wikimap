@@ -1,6 +1,6 @@
 # wikimap
 
-[![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml)
+[![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml) [![PyPI](https://img.shields.io/pypi/v/wikimap)](https://pypi.org/project/wikimap/) [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://pypi.org/project/wikimap/) [![license](https://img.shields.io/github/license/dhha22/wikimap)](LICENSE)
 
 English | [한국어](README.ko.md)
 
@@ -55,6 +55,22 @@ cd your-vault && python3 wikimap.py update
 
 Either way, `wikimap install` (or `python3 wikimap.py install`) sets it up as a Claude Code skill at `~/.claude/skills/wikimap/`; `install --project` writes to `./.claude` for per-repo setup. Existing `SKILL.md` customizations are never overwritten. Requires Python 3.8+, nothing else.
 
+## What it looks like
+
+```console
+$ wikimap update
+wikimap: 304 files indexed (2 changed, 0 deleted) in 147ms | skipped 2 non-indexed files (.tsv 2) | notes: 3 fresh, 0 stale | edges: 112 fresh, 2 stale | MAP.md updated
+
+$ wikimap search "session expiry policy"
+[NOTE fresh 2026-07-02] Q: how long do sessions last?
+  30 min sliding expiry; refresh token lives 14 days (REQ-02)
+  sources: specs/auth-spec.md
+specs/auth-spec.md:12  [Login policy]  (score 27)
+  REQ-01 session expiry is 30 minutes. See [[auth-plan]].
+```
+
+Every result is a file, a line number, and the matched lines — your agent jumps straight to the right section instead of re-reading whole files. The `[NOTE fresh]` on top is a previously saved answer, served only while its source hashes still match.
+
 ## Commands
 
 | Command | What it does |
@@ -69,6 +85,7 @@ Either way, `wikimap install` (or `python3 wikimap.py install`) sets it up as a 
 | `edge repin --src a --dst b` | An edge went stale because an endpoint was edited, but the connection still holds? Refresh the sha pins and keep the rationale — no retyping |
 | `notes` / `edges` `[--all] [--prune]` | List cached semantics; stale entries are hidden by default and prunable |
 | `import-graphify <graph.json>` | One-time migration of INFERRED edges from an existing graphify graph — with hash freshness retrofitted |
+| `install [--project]` | Set up as a Claude Code skill: copies `wikimap.py` + a `SKILL.md` to `~/.claude/skills/wikimap/` (or `./.claude` with `--project`). An existing `SKILL.md` is never overwritten |
 | `install --hook` | Git post-commit hook that runs `update` after every commit — appends to an existing hook, never replaces it |
 | `mv <old> <new> [--apply]` | Move/rename a doc and rewrite every wikilink, markdown, and image reference to it — including the moved file's own relative links and `semantics.jsonl` paths (content hash unchanged, so pinned semantics stay fresh). Dry run unless `--apply` |
 | `fix-links [--json]` | For each broken link the Health section counts: suggest close-match targets. Suggestions only — nothing is auto-applied |

@@ -1,6 +1,6 @@
 # wikimap
 
-[![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml)
+[![ci](https://github.com/dhha22/wikimap/actions/workflows/ci.yml/badge.svg)](https://github.com/dhha22/wikimap/actions/workflows/ci.yml) [![PyPI](https://img.shields.io/pypi/v/wikimap)](https://pypi.org/project/wikimap/) [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://pypi.org/project/wikimap/) [![license](https://img.shields.io/github/license/dhha22/wikimap)](LICENSE)
 
 [English](README.md) | 한국어
 
@@ -55,6 +55,22 @@ cd your-vault && python3 wikimap.py update
 
 어느 쪽이든 `wikimap install`(또는 `python3 wikimap.py install`)이 Claude Code 스킬로 `~/.claude/skills/wikimap/`에 설치해 주며, `install --project`는 repo별 설정을 위해 `./.claude`에 씁니다. 기존 `SKILL.md` 커스터마이징은 절대 덮어쓰지 않습니다. Python 3.8+ 외에는 아무것도 필요 없습니다.
 
+## 실제 모습
+
+```console
+$ wikimap update
+wikimap: 304 files indexed (2 changed, 0 deleted) in 147ms | skipped 2 non-indexed files (.tsv 2) | notes: 3 fresh, 0 stale | edges: 112 fresh, 2 stale | MAP.md updated
+
+$ wikimap search "세션 만료 정책"
+[NOTE fresh 2026-07-02] Q: 세션은 얼마나 유지되나?
+  30분 슬라이딩 만료; 리프레시 토큰은 14일 (REQ-02)
+  sources: specs/auth-spec.md
+specs/auth-spec.md:12  [로그인 정책]  (score 27)
+  REQ-01 세션 만료는 30분. [[auth-plan]] 참고.
+```
+
+모든 결과는 파일 + 라인 번호 + 매치된 라인입니다 — 에이전트가 파일 전체를 다시 읽는 대신 정확한 섹션으로 바로 점프합니다. 맨 위의 `[NOTE fresh]`는 이전에 저장된 답변으로, 원본 해시가 여전히 일치할 때만 표시됩니다.
+
 ## 명령어
 
 | 명령어 | 하는 일 |
@@ -69,6 +85,7 @@ cd your-vault && python3 wikimap.py update
 | `edge repin --src a --dst b` | 한쪽 문서가 수정돼 엣지가 stale이 됐지만 연결 자체는 여전히 유효할 때 — sha 핀만 갱신하고 rationale은 유지, 다시 타이핑할 필요 없음 |
 | `notes` / `edges` `[--all] [--prune]` | 캐시된 시맨틱 목록 — stale 항목은 기본 숨김, prune 가능 |
 | `import-graphify <graph.json>` | 기존 graphify 그래프의 INFERRED 엣지 1회성 이관 — 해시 신선도 소급 부여 |
+| `install [--project]` | Claude Code 스킬로 설치: `wikimap.py` + `SKILL.md`를 `~/.claude/skills/wikimap/`(`--project`면 `./.claude`)에 복사. 기존 `SKILL.md`는 절대 덮어쓰지 않음 |
 | `install --hook` | 매 커밋 후 `update`를 실행하는 git post-commit 훅 — 기존 훅에 append, 절대 교체하지 않음 |
 | `mv <old> <new> [--apply]` | 문서 이동/개명 + 그 문서를 가리키는 모든 위키링크·마크다운·이미지 참조 재작성 — 이동 파일 자신의 상대 링크와 `semantics.jsonl` 경로 포함(콘텐츠 해시는 불변이라 고정된 시맨틱은 fresh 유지). `--apply` 없으면 dry run |
 | `fix-links [--json]` | Health 섹션이 집계한 각 깨진 링크에 근사 매치 대상을 제안. 제안만 — 자동 적용 없음 |

@@ -470,6 +470,30 @@ class TestSemanticsFileSSOT(VaultTest):
                 (self.root / ".wikimap" / "semantics.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual([r["type"] for r in recs], ["note"], "stale edge must leave the file too")
 
+    def test_a_record_type_from_a_newer_wikimap_is_skipped_not_fatal(self):
+        self.add_semantics()
+        p = self.root / ".wikimap" / "semantics.jsonl"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "cluster-from-the-future", "payload": {"x": 1}}) + "\n")
+        (self.root / ".wikimap" / "index.db").unlink()
+        run(self.root, "update")
+        self.assertIn("[NOTE fresh", run(self.root, "search", "세션 만료"))
+        self.assertIn("test edge", run(self.root, "edges"))
+
+    def test_prune_never_drops_a_record_type_it_doesnt_understand(self):
+        self.add_semantics()
+        p = self.root / ".wikimap" / "semantics.jsonl"
+        future = {"type": "cluster-from-the-future", "payload": {"x": 1}}
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(future) + "\n")
+        write(self.root, "notes/orphan-note.md", "# 고립 문서\n\nsha가 바뀌어 엣지가 stale.")
+        run(self.root, "update")
+        run(self.root, "edges", "--prune")
+        recs = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()]
+        self.assertIn(future, recs,
+                      "prune rewrites the SSOT file — an unknown record must be carried through, "
+                      "or an older build would silently delete a newer build's data")
+
 
 class TestEdgeRepin(VaultTest):
     def test_repin_keeps_rationale_and_refreshes_shas(self):
@@ -831,6 +855,14 @@ class TestMvAndFixLinks(VaultTest):
         self.assertIn("archive/auth-spec-v2.md", out)
         self.assertIn("[fresh|claude]", out, "content unchanged — shas must stay valid")
         self.assertIn("(1 hops)", run(self.root, "path", "auth-spec-v2", "auth-plan"))
+
+    def test_mv_carries_the_embedding_to_the_new_path(self):
+        run(self.root, "update")
+        run(self.root, "embed", "set", "specs/auth-spec.md", "--vector", "[1.0, 0.0]")
+        run(self.root, "mv", "specs/auth-spec.md", "archive/auth-spec.md", "--apply")
+        out = run(self.root, "semsearch", "--vector", "[1.0, 0.0]")
+        self.assertIn("archive/auth-spec.md", out,
+                      "a renamed doc must keep its embedding, not orphan it at the old path")
 
     def test_fix_links_suggests_close_match(self):
         write(self.root, "notes/typo.md", "# typo\n\nsee [[auth-spce]] for details")

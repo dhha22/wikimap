@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "0.15.0"
+VERSION = "1.0.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -1045,9 +1045,16 @@ def load_semantics(root: Path):
             r = json.loads(ln)
         except ValueError:
             continue  # a hand-edited bad line must not take the whole layer down
-        if isinstance(r, dict) and r.get("type") in ("note", "edge", "embed"):
+        # any record with a "type" is kept, even one this build doesn't understand: a newer
+        # wikimap may write kinds we predate, and rewriters (prune, mv) round-trip this list
+        # back to the SSOT file — dropping them here would delete the newer build's data
+        if isinstance(r, dict) and isinstance(r.get("type"), str):
             recs.append(r)
     return recs
+
+
+def known_semantics(recs):
+    return [r for r in recs if r["type"] in ("note", "edge", "embed")]
 
 
 def compact_semantics(recs):
@@ -1116,7 +1123,7 @@ def sync_semantics(root: Path, db):
     db.execute("DELETE FROM notes")
     db.execute("DELETE FROM edges")
     db.execute("DELETE FROM embeds")
-    for r in compact_semantics(load_semantics(root)):
+    for r in known_semantics(compact_semantics(load_semantics(root))):
         if r["type"] == "note":
             db.execute(
                 "INSERT INTO notes(question, insight, created, sources) VALUES(?,?,?,?)",
@@ -2685,7 +2692,11 @@ def cmd_mv(root, db, args):
                 if s.get("path") == old:
                     s["path"] = new
                     sem_changed += 1
-        elif old in (r.get("src"), r.get("dst")):
+        elif r["type"] == "embed":
+            if r.get("path") == old:
+                r["path"] = new
+                sem_changed += 1
+        elif r["type"] == "edge" and old in (r.get("src"), r.get("dst")):
             if r["src"] == old:
                 r["src"] = new
             if r["dst"] == old:

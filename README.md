@@ -27,9 +27,9 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 ## Measured vs graphify (262-doc Korean/English vault, M-series Mac)
 
-<sub>The wikimap column is **measured on 0.15.0** (270-doc link-stripped Korean/English corpus, M-series Mac, median of 3–5 runs per row). The graphify column is from actually running graphify on the original 262-doc vault — the doc counts differ slightly but the scale is comparable, and the point is the order-of-magnitude gap, not the absolute numbers.</sub>
+<sub>The wikimap column is **measured on 1.0.0** (270-doc link-stripped Korean/English corpus, M-series Mac, median of 3–5 runs per row). The graphify column is from actually running graphify on the original 262-doc vault — the doc counts differ slightly but the scale is comparable, and the point is the order-of-magnitude gap, not the absolute numbers.</sub>
 
-| Operation | wikimap 0.15.0 | graphify (comparable vault, same change set) |
+| Operation | wikimap 1.0.0 | graphify (comparable vault, same change set) |
 |---|---|---|
 | Full index build | **0.28 s, $0** (indexing 0.22 s) | minutes + LLM extraction cost |
 | Update after editing 1 doc + adding 1 + deleting 1 | **0.07 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
@@ -49,9 +49,9 @@ Two more results worth naming:
 - **Golden set** (30 queries, Korean/English/mixed, 358-doc vault): **recall@5 30/30** — and still 30/30 after every feature release since 0.5.0. Ranking changes are gated on this set in CI, so a "speedup" that quietly costs you accuracy can't ship.
 - **Blind test** (20 fresh questions, written and judged by agents that didn't know which tool was which): wikimap **14/20** vs graphify **11/20**, and it won the usefulness vote **16:3:1** — all three judges unanimous on all 20.
 
-The test suite is 111 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
+The test suite is 114 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
 
-### Natural-language search vs graphify — v5 blind benchmark (wikimap 0.15.0)
+### Natural-language search vs graphify — v5 blind benchmark (wikimap 1.0.0)
 
 Earlier golden sets echoed document titles. The **v5** set does the opposite: 71 conversational questions aimed at the *body* of a doc (a decision, a number, an edge case), written by per-document agents that read the source and never saw a title. The answer key shares **zero documents** with the v3 and v4 sets, so a gain here is real search skill, not overfitting. Both tools run on the same 270-doc corpus; graphify reuses its v1 graph (314 s + 2.4M tokens to build), wikimap indexes in 0.23 s at $0.
 
@@ -65,7 +65,7 @@ xychart-beta
     line [0.183, 0.394, 0.563, 0.690, 0.338]
 ```
 
-<sub>bars = wikimap 0.15.0, **single query** · **3-phrasing fan-out** (raw question + 2 agent rewrites, one call) · line = graphify (v1 graph, BFS) — full numbers in the table below</sub>
+<sub>bars = wikimap 1.0.0, **single query** · **3-phrasing fan-out** (raw question + 2 agent rewrites, one call) · line = graphify (v1 graph, BFS) — full numbers in the table below</sub>
 
 | Metric | wikimap — single query | wikimap — fan-out | graphify |
 |---|---|---|---|
@@ -77,7 +77,7 @@ xychart-beta
 | top-40 misses | 14 | **0** | — |
 | Link-generation (270 docs) | **0.59 s, 0 tokens** | — | 314 s, 2.4M tokens |
 
-<sub>The two wikimap columns are **query modes, not versions** — both re-measured on 0.15.0, reproducing 0.13.0/0.14.0 to three decimals (0.15.0 changed no rankings, by design).</sub>
+<sub>The two wikimap columns are **query modes, not versions** — both re-measured on 1.0.0, reproducing 0.13.0/0.14.0 to three decimals (the 0.15.0 speedup changed no rankings, by design).</sub>
 
 **Why wikimap wins here without an LLM:** the work happens at *query* time, not build time. Function words are dropped by how common they are in your corpus (no hardcoded stoplist, so it works in any language), matches scattered across a document's sections are added up together, and word endings are handled generically — `core:ui로` still finds `core` and `ui`. All of it deterministic, all of it $0.
 
@@ -91,7 +91,7 @@ The rankings get fused, so a document that several phrasings agree on rises to t
 
 The tradeoff is honest: recall@1/@3 dip slightly, because fusing several rankings dilutes the single best hit. Use fan-out when you'd rather not miss; use a single query when you want the sharpest top hit.
 
-### 0.15.0 — same results, half the wait
+### Fan-out, without the wait (0.15.0)
 
 Fan-out made search better but slower — three phrasings meant three full scans. 0.15.0 fixes that by **caching, not by rescoring**, so it's twice as fast and returns *exactly* the same results.
 
@@ -235,6 +235,21 @@ wikimap's goal is that **every document in the folder is findable — whatever i
 - **Images** (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) — no content analysis; indexed by filename plus every **alt text** that references them (`![alt](img.png)`, `<img alt=…>`), and image references join the link graph. "Where is that checkout-flow diagram?" resolves by name or alt. `.svg` additionally contributes its `<title>`/`<desc>`/text nodes.
 
 It does not parse code ASTs — if you need a call graph of a codebase, use a code-aware tool. It shines where your corpus is prose with structure: specs, policies, plans, notes, research.
+
+## Stability
+
+**1.0 means the interface is settled.** Within 1.x, these won't break:
+
+- **The CLI** — command names, flags, and their meanings.
+- **`--json` output** — existing fields keep their names and types. New fields may be *added*, so parse leniently.
+- **`.wikimap/semantics.jsonl`** — the file you commit. A newer wikimap may write record types an older one doesn't know; older builds skip them and **preserve them on rewrite**, so upgrading is safe in both directions.
+
+Deliberately **not** covered, so the tool can keep getting better:
+
+- **`.wikimap/index.db`** — schema, tables, ranking internals. It's a disposable cache: delete it and `update` rebuilds it from your files. Don't read it directly; use the CLI.
+- **Result ordering** — search rankings improve between releases. The golden set gates accuracy in CI, not exact order.
+
+Breaking any of the first group means 2.0. See the [changelog](CHANGELOG.md).
 
 ## License
 

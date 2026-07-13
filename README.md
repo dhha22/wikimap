@@ -12,14 +12,16 @@ Built for AI coding assistants (Claude Code and friends) working against a knowl
 
 ## Why not a knowledge-graph tool or RAG?
 
-Tools like [graphify](https://github.com/Graphify-Labs/graphify) extract entities and relationships with an LLM **at build time** (eager extraction). That buys you inferred connections, but the bill comes on every update: change a doc, pay for re-extraction. Let the index drift for a week and your "incremental" update re-extracts half the corpus. RAG has the same eagerness problem — it embeds the whole corpus up front and hands you a vector store to babysit.
+Knowledge-graph tools (like [graphify](https://github.com/Graphify-Labs/graphify)) and RAG both do their thinking **up front**: send the whole corpus through an LLM, get a graph or a vector store back. That works — but you pay for it again on every update. Change one doc, pay to re-extract. Ignore your vault for a week, and the "incremental" update quietly re-processes half of it.
 
-wikimap inverts the design: **eager structure, lazy semantics.**
+wikimap flips this: **parse the structure now, learn the meaning later.**
 
-- **Structure is free.** Titles, headings, wikilinks, markdown links, requirement IDs, code-file references — all extracted by deterministic parsing. No LLM, no embeddings, no API key.
-- **Semantics are earned at answer time.** When your assistant answers a question by synthesizing documents, it saves the conclusion as a *note* pinned to the source files' content hashes. When it confirms an unwritten connection between two docs, that becomes an *edge* pinned to both hashes. And when keyword search isn't enough for a natural-language question, the assistant can embed docs on demand — wikimap stores and cosine-ranks the vectors, but **the agent generates them** (any model), so there's still no build-time LLM and no bundled dependency. Every one of these is pinned to a content hash: change a source file and the cached knowledge goes stale automatically, silently dropping out instead of feeding the model outdated facts.
+- **Structure is free** — titles, headings, links, requirement IDs. Plain parsing, no LLM, no API key, no embeddings to maintain.
+- **Meaning is earned when you ask.** When your agent works out an answer, it saves that answer. When it confirms two docs are related, it saves the link. Nothing is precomputed on the off-chance you'll need it.
 
-The LLM cost is proportional to **what you actually asked**, never to corpus size.
+The trick that makes this safe: **everything saved is stamped with the source file's content hash.** Edit the file and the stale answer disappears on its own, rather than quietly feeding your agent an outdated fact.
+
+So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 ## Measured vs graphify (262-doc Korean/English vault, M-series Mac)
 
@@ -40,7 +42,12 @@ The LLM cost is proportional to **what you actually asked**, never to corpus siz
 
 At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time — an FTS5 trigram index kicks in at ≥500 docs), incremental update with 3 changes **0.19 s**, search 60–100 ms via FTS5 (vs ~0.3 s linear fallback). Queries containing terms under 3 characters fall back to the exact linear scan, so CJK short-word recall is never sacrificed for speed.
 
-On an expanded 30-query golden set (Korean/English/mixed, 358-doc vault): **recall@5 30/30** (re-verified at 30/30 after HTML indexing in 0.5.0, the semantics-file migration in 0.6.0, PDF/image indexing in 0.7.0, CMap decoding + partial-match fallback in 0.8.0, alias indexing in 0.9.0, the suggest proximity ranking in 0.10.0, the fan-out RRF fusion + script-whitelist removal in 0.14.0, and the match-caching speedup in 0.15.0). On a separate blind benchmark — 20 fresh natural queries written and judged by agents that didn't know which tools were being compared — wikimap scored recall@5 14/20 vs graphify's 11/20 (cited anywhere in its output), and won the blind usefulness vote 16:3:1 with three judges unanimous on all 20 queries. Ranking changes are gated by this kind of golden set in CI — the test suite (`python3 tests.py`, stdlib only) covers incremental sync, ghost-free deletes, byte-identical determinism, FTS consistency at scale, CJK short-term fallback, ignore config, map relocation, HTML tag-strip indexing, semantics surviving DB deletion, the ≤0.5.x migration path, `--json` schemas, hook append-preservation, phrase/field/tag/type queries, partial-fallback marking, PDF noise exclusion, per-font CMap decoding (CID hex/literal, bfrange, ASCII85+Flate chains, Form XObjects, Type3), image alt indexing, dotted-filename wikilink resolution, `mv` reference rewriting, console-script installs, install never touching an existing `SKILL.md`, multi-target skill installs (Claude Code + the open agent-skills path) with per-target preservation, idempotent `AGENTS.md` block registration, corpus-derived structure-word filtering (no hardcoded vocabulary), sha-pinned agent-supplied embeddings with cosine `semsearch` and auto-stale on edit, frontmatter alias search and alias wikilink resolution, idempotent `link add` insertion, the parser-version cache rescan, and directory-proximity candidate enumeration with filename-token ranking. CI runs it on macOS, Linux, and Windows, Python 3.8 and 3.13.
+Two more results worth naming:
+
+- **Golden set** (30 queries, Korean/English/mixed, 358-doc vault): **recall@5 30/30** — and still 30/30 after every feature release since 0.5.0. Ranking changes are gated on this set in CI, so a "speedup" that quietly costs you accuracy can't ship.
+- **Blind test** (20 fresh questions, written and judged by agents that didn't know which tool was which): wikimap **14/20** vs graphify **11/20**, and it won the usefulness vote **16:3:1** — all three judges unanimous on all 20.
+
+The test suite is 104 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
 
 ### Natural-language search vs graphify — v5 blind benchmark (wikimap 0.15.0)
 
@@ -70,20 +77,28 @@ xychart-beta
 
 <sub>The two wikimap columns are **query modes, not versions** — both re-measured on 0.15.0, reproducing 0.13.0/0.14.0 to three decimals (0.15.0 changed no rankings, by design).</sub>
 
-0.13.0 was the first version where wikimap led graphify on **every** retrieval metric — a reversal from v3, where it trailed 5× on the same kind of set. The lift comes from query-time matching, all at build-time-LLM $0: idf-weighted coverage gating (function words drop out by corpus frequency, no hardcoded stoplist), document-level rollup of matches scattered across sections, long-query auto-OR, and language-agnostic term variants that bridge agglutinative morphology (`core:ui로` → `core`, `ui`).
+**Why wikimap wins here without an LLM:** the work happens at *query* time, not build time. Function words are dropped by how common they are in your corpus (no hardcoded stoplist, so it works in any language), matches scattered across a document's sections are added up together, and word endings are handled generically — `core:ui로` still finds `core` and `ui`. All of it deterministic, all of it $0.
 
-**0.14.0 adds query fan-out**: the calling agent passes the raw question *plus* 1–2 rewrites in the vault's vocabulary in one `search` call, and the rankings are rank-fused (RRF, uniform weights). The raw question is always a voter — rewrites add recall without replacing it — so the downside is capped while every hard miss (a question whose wording shares no vocabulary with the answer doc) becomes recoverable: top-40 misses went 14 → 0. The rewrites are the agent's job at query time (no LLM in the core, no extra API round-trip — they ride the same assistant turn); fusing 3 phrasings costs only ~+0.1 s over a single query as of 0.15.0, since process startup, index load, and the doc haystacks are all shared. The small recall@1/@3 dip is the RRF dilution tradeoff; `search --json` now also reports per-term document frequency (`terms: [{term, df}]`) so a weak result can be re-queried by replacing exactly the dead (`df: 0`) tokens.
+**Fan-out is the one thing you have to opt into.** Pass the question *plus* a rewrite or two in one call:
 
-### 0.15.0 — same rankings, half the latency
+```bash
+wikimap search "how long do sessions last?" "session expiry" "REQ-02 timeout"
+```
 
-Fan-out made search better and slower: fusing 3 phrasings meant 3 full scans, and a single query had drifted to ~0.30 s. 0.15.0 is a pure **ranking-invariant** optimization — profiling showed ~70% of query time in per-section variant scans and ~19% rebuilding per-doc haystacks for idf, so the fix is caching, not rescoring: dominated-variant elimination for boolean hit tests, a doc-level term prefilter fed from the idf pass, per-doc title/alias/path match caching, and one haystack build per process (fan-out reuses it).
+The rankings get fused, so a document that several phrasings agree on rises to the top. The original question always stays in the vote, so rewrites can only add — and that's what closed the gap: **14 hard misses → 0**. Your agent writes the rewrites (it's already in the loop; no extra API call), and three phrasings cost only ~0.1 s more than one.
 
-| | 0.14.0 | 0.15.0 | rankings changed |
+The tradeoff is honest: recall@1/@3 dip slightly, because fusing several rankings dilutes the single best hit. Use fan-out when you'd rather not miss; use a single query when you want the sharpest top hit.
+
+### 0.15.0 — same results, half the wait
+
+Fan-out made search better but slower — three phrasings meant three full scans. 0.15.0 fixes that by **caching, not by rescoring**, so it's twice as fast and returns *exactly* the same results.
+
+| | 0.14.0 | 0.15.0 | results changed |
 |---|---|---|---|
-| Single query (median) | 0.30 s | **0.15 s** | **0 of 74** |
-| 3-phrasing fan-out (median) | 0.66 s | **0.26 s** | **0 of 74** |
+| Single query | 0.30 s | **0.15 s** | **none** |
+| 3-phrasing fan-out | 0.66 s | **0.26 s** | **none** |
 
-The invariance is the point, and it is checked rather than asserted: all 148 rankings across both paths are byte-identical to 0.14.0, every recall/MRR figure is unchanged to three decimals, and 104 tests pass. **A speedup that moved a single ranking would be a regression, not a win** — so recall@5 stays 0.873 on v5, and the entire accuracy story above still holds unedited.
+That last column is the point, and it's verified rather than claimed: all 148 rankings are identical to 0.14.0, down to the decimal. **A speedup that quietly reshuffled your results wouldn't be a win — it'd be a bug.**
 
 Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
 
@@ -132,35 +147,43 @@ Every result is a file, a line number, and the matched lines — your agent jump
 
 ## Commands
 
+The two you'll actually type:
+
 | Command | What it does |
 |---|---|
-| `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | Incremental re-index (sha-diff) + regenerate `MAP.md`, the one-page vault map agents read first. Prints coverage — indexed vs skipped counts by extension, so nothing is dropped silently. `MAP.md` ends with a Health section: orphan docs, broken links, stale semantics. Excludes: `.wikimapignore` at the vault root (one dir/glob per line, persistent) or `--ignore` (this run only). `--map-path`/`--no-map` relocate or disable the generated map — persisted in the index |
-| `search "query" ["variant" ...] [-n 8] [-C 3 \| --full] [--hybrid <vec>\|-]` | Ranked section search — filename, title, and heading matches boosted; FTS5-accelerated on vaults ≥500 docs. Exact file:line + matched lines (≤3). `-C N` adds N context lines, `--full` prints the whole section. Fresh notes surface first. Query syntax: `"exact phrase"`, `title:` / `path:` / `heading:` / `tag:` field filters (frontmatter `tags: [a, b]` are indexed and summarized in the map), and `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. Long conversational queries are gated by matched-term idf (function words drop out by corpus frequency) and rolled up per document; when no section matches every term, results relax to a majority-of-terms OR marked `partial k/n` — never mixed with full matches; field filters stay hard. **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — pass the raw question plus 1–2 rewrites; a doc multiple phrasings agree on wins. `--json` reports `weak: true` on empty/partial/low-score results and `terms: [{term, df}]` per query token — `df: 0` terms are dead vocabulary to replace when re-querying. `--hybrid` folds an agent-supplied query embedding into the keyword ranking in one call (JSON array, or `-`/omitted to read stdin) — docs found by both signals float up, semantic-only docs splice in |
-| `links <target>` | Outlinks, backlinks, and inferred connections of a doc; or every doc mentioning a `REQ-nn` ID. Trust tags on every entry: `[linked\|…]` = a human wrote it in the source, `[inferred\|…]` = guessed then confirmed, sha-verified |
-| `path <a> <b>` | Shortest connection path between two docs — BFS over wiki/markdown links (both directions) plus fresh inferred edges |
-| `note add` | Save an answer-time insight, pinned to source content hashes |
-| `suggest [--doc path] [-n 10] [--wikilink]` | Heuristic candidates for unwritten connections: shared rare terms, shared requirement IDs, shared code references, directory proximity, filename-token overlap. Sub-second, no LLM; `-n 0` lifts the cap for bootstrap sweeps; JSON rows carry `dir: same\|sibling\|far`. `--wikilink` prints paste-ready `[[links]]` — promote real connections into the doc body, where every tool can read them |
-| `link add <doc> <target>... [--section H] [--apply]` | Insert `- [[target]]` items into a doc's link-list section — reuses an existing Related/See also section, else creates `## Related` at the end. Idempotent: an already-linked target is a no-op. Targets may be stems, aliases, or paths. Dry run unless `--apply` |
-| `embed set <doc> --vector <json>` / `embed status` | Store an agent-generated embedding for a doc (pinned to its content hash — auto-stale on edit) / report coverage and what needs (re)embedding. wikimap stores and searches vectors; **the agent generates them** — no build-time LLM, no bundled model |
-| `semsearch --vector <json> [-n 10]` | Cosine-rank docs by an agent-supplied query embedding — language-agnostic semantic search for natural-language questions that share no exact terms with the doc. Only fresh embeddings are ranked |
-| `edge add` | Confirm a connection (agent judges `suggest` candidates); pinned to both files' hashes |
-| `edge repin --src a --dst b` | An edge went stale because an endpoint was edited, but the connection still holds? Refresh the sha pins and keep the rationale — no retyping |
-| `notes` / `edges` `[--all] [--prune]` | List cached semantics; stale entries are hidden by default and prunable |
-| `import-graphify <graph.json>` | One-time migration of INFERRED edges from an existing graphify graph — with hash freshness retrofitted |
-| `install [--project] [--target claude\|agents\|all] [--agents-md]` | Register as an agent skill: copies `wikimap.py` + a `SKILL.md` to `~/.claude/skills/wikimap/` (Claude Code) and `~/.agents/skills/wikimap/` (open agent-skills standard — Codex, Copilot, ...). `--project` writes to `./.claude` + `./.agents` for per-repo setup; `--agents-md` inserts an idempotent usage block into `./AGENTS.md`. An existing `SKILL.md` is never overwritten |
-| `install --hook` | Git post-commit hook that runs `update` after every commit — appends to an existing hook, never replaces it |
-| `mv <old> <new> [--apply]` | Move/rename a doc and rewrite every wikilink, markdown, and image reference to it — including the moved file's own relative links and `semantics.jsonl` paths (content hash unchanged, so pinned semantics stay fresh). Dry run unless `--apply` |
-| `fix-links [--json]` | For each broken link the Health section counts: suggest close-match targets. Suggestions only — nothing is auto-applied |
+| `update` | Re-index what changed and refresh `MAP.md`. Sub-second, $0. Run it after edits (or let the git hook do it) |
+| `search "query" ["rewrite" ...]` | Find the section that answers a question. Returns file, line number, and the matching lines. Pass extra phrasings to fuse them into one ranking |
 
-`search`, `links`, `path`, `suggest`, `notes`, `edges`, and `semsearch` all take **`--json`** — structured output for agents and scripts, no regex-scraping of human output. `search --json` sets `weak: true` when results are empty, partial, or low-scoring — the cue for an agent to reformulate the query in document vocabulary, or fold in an on-demand embedding via `search --hybrid` / `semsearch` — and reports `terms: [{term, df}]` so the reformulation replaces exactly the dead (`df: 0`) tokens and keeps the ones that hit. Schemas are stable and covered by the test suite.
+Everything else, grouped by what it's for:
 
-## How inferred connections work without eager LLM extraction
+| | Command | What it does |
+|---|---|---|
+| **Follow connections** | `links <doc>` | What links to this, what it links to — plus every doc mentioning a `REQ-nn` ID. Each entry says whether a human wrote the link or the agent inferred it |
+| | `path <a> <b>` | The shortest chain of links between two docs |
+| **Grow connections** | `suggest` | Propose links that *should* exist, from free signals (shared rare terms, same requirement IDs, folder proximity). Sub-second, no LLM |
+| | `link add <doc> <target>` | Write a confirmed link into the doc body. Dry run unless `--apply` |
+| **Remember answers** | `note add` | Save an answer your agent worked out, pinned to the sources it came from |
+| | `edge add` / `edge repin` | Confirm a connection between two docs / re-pin it after an edit |
+| | `notes` / `edges` | List what's cached; stale entries hide themselves |
+| **Semantic search** | `embed set` / `semsearch` | For questions that share *no words* with the answer. Your agent supplies the vectors (any model); wikimap just stores and ranks them |
+| **Housekeeping** | `mv <old> <new>` | Rename a doc and rewrite every link pointing at it |
+| | `fix-links` | Suggest targets for broken links (never auto-applies) |
+| | `install` | Register as an agent skill, or `--hook` to auto-`update` on every commit |
 
-1. `suggest` proposes candidate pairs from free signals: rare terms shared by only 2–4 documents, shared requirement IDs, references to the same source files, directory proximity, and filename-token overlap. The folder structure a human already built is free semantics — same-directory and sibling-directory pairs are always candidates, even with no shared content, and every JSON row carries `dir: same|sibling|far` so a judging agent can spend its budget where measured precision is highest. Pairs already linked explicitly are excluded.
-2. Your assistant reads only the top candidates for the doc that changed, then writes the real ones into the doc body with `link add --apply` (or `edge add` when the doc can't be edited). Cost scales with the edit, not the corpus.
-3. Confirmed edges appear in `links` output and `MAP.md`, and go stale automatically when either endpoint changes. Stale-because-edited but still valid? `edge repin` re-pins it after review, rationale intact.
+Anything cached — a note, an edge, an embedding — is **pinned to the source file's content hash**. Edit that file and the cached knowledge goes stale and drops out on its own, instead of feeding your agent a stale fact.
 
-**Bootstrapping a link-less corpus**: drop wikimap into a folder of documents that have no links at all, run `suggest -n 0 --json` for the full candidate list, let your assistant judge each pair from titles and shared signals, and apply the genuine ones with `link add`. Measured on a 348-doc bilingual vault with all 949 wikilinks stripped: the candidate sweep runs in under half a second and rediscovers **85% of the human-written body links** (70% before the 0.10.0 proximity signals); the LLM only ever judges candidate pairs, never the corpus. On a separate 271-doc link-reconstruction benchmark against an LLM extraction pipeline (which spent 314 s and 2.4M tokens), wikimap's top-300 candidates matched its precision while the full sweep reached every ground-truth pair the LLM pipeline capped out at 75% of.
+Every query command takes `--json`. Run `wikimap <command> --help` for the full flags: phrase/field/type filters, context lines, ignore rules, and the rest.
+Migrating from graphify? `import-graphify <graph.json>` carries your existing inferred edges over.
+
+## How connections get discovered without an LLM
+
+1. **`suggest` proposes candidates for free.** Two docs that share a rare term, cite the same requirement ID, or just live in the same folder are probably related. The folder structure you already built is free semantics — no LLM needed to notice it.
+2. **Your agent judges only the candidates**, then writes the real ones into the doc with `link add`. It reads a shortlist, never the whole corpus — so cost scales with your edit, not your vault.
+3. **Confirmed links go stale on their own** when either doc changes. Still valid after an edit? `edge repin` keeps it without retyping the rationale.
+
+**Starting from a folder with no links at all?** Run `suggest -n 0 --json`, let your agent judge the candidates, apply the real ones with `link add`.
+
+We tested this the hard way: took a 348-doc vault, **stripped all 949 of its human-written links**, and tried to rebuild them. The candidate sweep takes under half a second and recovers **85% of the original links** — and the LLM only ever looks at candidate pairs, never the corpus.
 
 ## Outputs
 
@@ -185,7 +208,7 @@ wikimap's goal is that **every document in the folder is findable — whatever i
 - **Markdown** — the core: frontmatter (`title`, `tags`), headings, wikilinks, md links.
 - **Plain-text prose** (`.txt`, `.rst`, `.org`, `.adoc`) — sectioned by paragraph blocks.
 - **HTML** (`.html`, `.htm`) — tag-stripped, `<title>`/`<h1>` as title, sectioned by heading tags; `<a href>` anchors to local docs join the link graph, `<script>`/`<style>` excluded.
-- **PDF** — deterministic text extraction with stdlib only. Per-font **ToUnicode CMap decoding** handles CID-encoded (most CJK) and subset-font PDFs: the Page→Resources→Font object chain is resolved per font (never unioned — subset code spaces collide), Form XObjects are traversed, 1- and 2-byte code spaces and `[/ASCII85Decode /FlateDecode]` filter chains are supported, and each content stream becomes a search section (a slide/page is the natural unit). PDFs that still don't decode (scanned images) fall back to raw literal-string harvest, then **name+path indexing** — and the update line says so explicitly: no OCR, no silent garbage; every rung is noise-gated.
+- **PDF** — text extracted with the standard library alone, no dependencies. Handles the awkward cases (CJK and subset-embedded fonts), and treats each page as its own searchable section. A scanned-image PDF can't be read by anyone without OCR — so wikimap falls back to indexing it by name and **says so in the update line**, rather than pretending it worked.
 - **Images** (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) — no content analysis; indexed by filename plus every **alt text** that references them (`![alt](img.png)`, `<img alt=…>`), and image references join the link graph. "Where is that checkout-flow diagram?" resolves by name or alt. `.svg` additionally contributes its `<title>`/`<desc>`/text nodes.
 
 It does not parse code ASTs — if you need a call graph of a codebase, use a code-aware tool. It shines where your corpus is prose with structure: specs, policies, plans, notes, research.

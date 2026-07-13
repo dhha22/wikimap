@@ -111,7 +111,9 @@ PDF_SHOWTEXT = re.compile(rb"\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|\")")
 PDF_ARRAY = re.compile(rb"\[((?:\\.|[^\\\]])*)\]\s*TJ", re.DOTALL)
 PDF_LITERAL = re.compile(rb"\(((?:\\.|[^\\()])*)\)")
 PDF_TITLE = re.compile(rb"/Title\s*\(((?:\\.|[^\\()])*)\)")
-PDF_WORD = re.compile(r"[A-Za-z0-9]{3,}|[가-힣]{2,}|[぀-ヿ一-鿿]{2,}")
+# any-script letter runs (no script whitelist) — binary noise decoded as latin-1
+# yields valid "letters" (é ñ ÿ), so the wordish ratio gates stay the real defense
+PDF_WORD = re.compile(r"[^\W\d_]{2,}")
 
 
 def sha256_of(path: Path) -> str:
@@ -1150,7 +1152,7 @@ def cmd_import_graphify(root, db, args):
     )
 
 
-TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9_]{2,}")
+TOKEN = re.compile(r"[^\W\d_]\w+")
 
 
 def name_tokens(path):

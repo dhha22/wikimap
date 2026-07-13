@@ -379,6 +379,18 @@ class TestSuggestProximity(VaultTest):
         self.assertGreater(logging_pair["score"], bare_pair["score"])
         self.assertTrue(any(s.startswith("name:") for s in logging_pair["signals"]))
 
+    def test_shared_term_signal_is_script_agnostic(self):
+        # far-dir pair with disjoint filenames: the only bridge is a shared rare
+        # Cyrillic term — the content tokenizer must not be a script whitelist
+        write(self.root, "reports/q1.md", "# Бюджетирование квартала\n\nzxqjjj")
+        write(self.root, "archive/z9.md", "# Бюджетирование прошлое\n\nzxqkkk")
+        run(self.root, "update")
+        pairs = self.suggest_pairs()
+        key = ("archive/z9.md", "reports/q1.md")
+        self.assertIn(key, pairs)
+        self.assertTrue(any("бюджетирование" in s for s in pairs[key]["signals"]),
+                        pairs.get(key))
+
     def test_sibling_dir_pair_enumerated(self):
         write(self.root, "policy/feed/feed-list-policy.md", "# a\n\nzxqfff")
         write(self.root, "policy/comment/comment-state-policy.md", "# b\n\nzxqggg")
@@ -650,6 +662,20 @@ class TestPdfIndexing(VaultTest):
         self.assertIn("계약서-2026-스캔본.pdf", run(self.root, "search", "계약서"))
         self.assertIn("no results", run(self.root, "search", "binary scan blob"),
                       "binary noise must never leak into the index")
+
+    def test_non_latin_non_cjk_pdf_text_indexed(self):
+        # the word-count gate must accept any script, not a whitelist — a PDF
+        # written entirely in Cyrillic (UTF-16BE literals) is real text
+        cyr = "Отчет платеж бюджет квартал компания"
+        lit = b"\xfe\xff" + cyr.encode("utf-16-be")
+        pdf = (b"%PDF-1.1\n1 0 obj\n<< /Length 120 >>\nstream\n"
+               b"BT /F1 12 Tf (" + lit + b") Tj ET\n"
+               b"endstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n")
+        (self.root / "reports").mkdir()
+        (self.root / "reports/otchet.pdf").write_bytes(pdf)
+        out = run(self.root, "update")
+        self.assertNotIn("text-extraction failed", out)
+        self.assertIn("reports/otchet.pdf", run(self.root, "search", "платеж"))
 
 
 def make_pdf(*objects):

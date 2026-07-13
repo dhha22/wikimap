@@ -1208,30 +1208,55 @@ def structure_words(paths, ratio=0.06):
     return {t for t, c in df.items() if c >= cutoff}
 
 
-def query_idf(db, terms):
+def minimal_variants(variants):
+    """The subset of variants sufficient for a boolean substring hit-test: if a
+    kept variant is itself a substring of another, the longer one can never match
+    without the shorter also matching, so it is dropped. Score counting must keep
+    the full set — only any()-style checks may use this."""
+    out = []
+    for v in sorted(variants, key=len):
+        if not any(m in v for m in out):
+            out.append(v)
+    return out
+
+
+def doc_haystacks(db):
+    hays = {}
+    for path, title in db.execute("SELECT path, title FROM files"):
+        hays[path] = [(title or "").lower() + " " + path.lower()]
+    for path, heading, content in db.execute("SELECT path, heading, content FROM sections"):
+        if path in hays:
+            hays[path].append(heading.lower())
+            hays[path].append(content.lower())
+    return {p: " ".join(parts) for p, parts in hays.items()}
+
+
+def query_idf(db, terms, hays=None):
     """log(ndocs/df) per term over the corpus's searchable text — high for rare
     content words, ~0 for function words that appear almost everywhere. Purely
-    corpus-derived (no hardcoded stoplist), so it stays language-agnostic."""
+    corpus-derived (no hardcoded stoplist), so it stays language-agnostic.
+    Also returns per-doc hit sets so search can skip terms a doc can't match."""
     if not terms:
-        return {}, 0, {}
+        return {}, 0, {}, {}
+    if hays is None:
+        hays = doc_haystacks(db)
     df = {t: 0 for t in terms}
-    variants = {t: term_variants(t) for t in terms}
-    ndocs = 0
-    seen = {}
-    for path, title in db.execute("SELECT path, title FROM files"):
-        seen[path] = {"hay": (title or "").lower() + " " + path.lower()}
-        ndocs += 1
-    for path, heading, content in db.execute("SELECT path, heading, content FROM sections"):
-        if path in seen:
-            seen[path]["hay"] += " " + heading.lower() + " " + content.lower()
-    for rec in seen.values():
-        hay = rec["hay"]
-        for t in terms:
-            if any(v in hay for v in variants[t]):
-                df[t] += 1
-    ndocs = max(ndocs, 1)
+    variants = {t: minimal_variants(term_variants(t)) for t in terms}
+    # a token repeated in the query has always been df-counted once per
+    # occurrence; keep that so rankings stay byte-identical
+    counts = {}
+    for t in terms:
+        counts[t] = counts.get(t, 0) + 1
+    doc_hits = {}
+    for path, hay in hays.items():
+        hits = {t for t in counts if any(v in hay for v in variants[t])}
+        if hits:
+            doc_hits[path] = hits
+            for t in hits:
+                df[t] += counts[t]
+    ndocs = max(len(hays), 1)
     idf = {t: math.log(ndocs / df[t]) if df[t] else math.log(ndocs) for t in terms}
-    return idf, sum(idf.values()), df
+    return idf, sum(idf.values()), df, doc_hits
 
 
 def dir_proximity(a, b):
@@ -1866,16 +1891,39 @@ def cmd_search(root, db, args):
                 db.execute("SELECT path, line, heading, content FROM sections").fetchall())
         return full_scan[0]
 
-    def collect(section_rows, require_all, terms, plain, idf, total_idf, long_query, pvariants):
+    hay_cache = []
+
+    def doc_hays():
+        if not hay_cache:
+            hay_cache.append(doc_haystacks(db))
+        return hay_cache[0]
+
+    def collect(section_rows, require_all, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs):
         # roll matches up to the DOCUMENT: plain terms scattered across several
         # sections of one doc are unioned, so a doc that mentions each query term
         # once (in different sections) still clears the coverage gate. The single
         # best-scoring section is kept for display.
         docs = {}
+        # title/alias/path hits are doc-level facts — compute once per doc, and
+        # only for terms the doc-level prefilter says can match at all
+        field_cache = {}
         for path, line, heading, content in section_rows:
-            title_l, heading_l, content_l = titles.get(path, "").lower(), heading.lower(), content.lower()
-            path_l = path.lower()
-            al = doc_aliases.get(path, ())
+            fc = field_cache.get(path)
+            if fc is None:
+                title_l = titles.get(path, "").lower()
+                path_l = path.lower()
+                al = doc_aliases.get(path, ())
+                pfield = {}
+                for t in doc_hits.get(path, ()):
+                    vs = hitvs[t]
+                    pfield[t] = (
+                        any(v in title_l for v in vs),
+                        any(v in a for v in vs for a in al),
+                        any(v in path_l for v in vs),
+                    )
+                fc = field_cache[path] = (title_l, path_l, al, pfield)
+            title_l, path_l, al, pfield = fc
+            heading_l, content_l = heading.lower(), content.lower()
             sec_score, ok, sec_terms = 0, True, set()
             for f, t in terms:
                 if f == "title":
@@ -1889,10 +1937,11 @@ def cmd_search(root, db, args):
                 elif f == "type":
                     hit = Path(path).suffix.lower() in TYPE_EXTS[t]
                 else:
-                    vs = pvariants[t]
-                    in_title = any(v in title_l for v in vs)
-                    alias_hit = any(v in a for v in vs for a in al)
-                    in_path = any(v in path_l for v in vs)
+                    doc_field = pfield.get(t)
+                    if doc_field is None:
+                        continue
+                    in_title, alias_hit, in_path = doc_field
+                    vs = hitvs[t]
                     in_head = any(v in heading_l for v in vs)
                     in_body = any(v in content_l for v in vs)
                     if in_title or alias_hit or in_path or in_head or in_body:
@@ -1900,7 +1949,7 @@ def cmd_search(root, db, args):
                         w = 1 + idf.get(t, 0)
                         sec_score += w * (
                             8 * (in_title or alias_hit) + 6 * in_path
-                            + 5 * in_head + min(sum(content_l.count(v) for v in vs), 5)
+                            + 5 * in_head + min(sum(content_l.count(v) for v in pvariants[t]), 5)
                         )
                     continue
                 # field filters are explicit constraints — hard even in partial mode.
@@ -1960,7 +2009,14 @@ def cmd_search(root, db, args):
         # coverage gate. Drop it — field-qualified terms are kept regardless.
         terms = [(f, t) for f, t in terms if f is not None or len(t) >= 2]
         plain = [t for f, t in terms if f is None]
-        idf, total_idf, df = query_idf(db, plain)
+        idf, total_idf, df, doc_hits = query_idf(db, plain, doc_hays())
+        hitvs = {t: minimal_variants(term_variants(t)) for t in plain}
+        # haystacks don't carry aliases, so an alias-only match must be added to
+        # the prefilter or collect() would never see it
+        for path, al in doc_aliases.items():
+            for t in plain:
+                if any(v in a for v in hitvs[t] for a in al):
+                    doc_hits.setdefault(path, set()).add(t)
         # a conversational query is mostly function words: AND-matching every plain
         # term is impossible, so long queries skip the AND pre-filter and go
         # straight to an idf-gated OR over a full scan. Short queries keep strict AND.
@@ -1982,11 +2038,11 @@ def cmd_search(root, db, args):
                     chunk,
                 ).fetchall()
         pvariants = {t: term_variants(t) for f, t in terms if f is None}
-        results = collect(rows, not long_query, terms, plain, idf, total_idf, long_query, pvariants)
+        results = collect(rows, not long_query, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs)
         partial = long_query
         if not results and not long_query and len(plain) >= 2:
             # every-term AND came up empty — relax plain terms to an idf-gated OR
-            results = collect(all_sections(), False, terms, plain, idf, total_idf, long_query, pvariants)
+            results = collect(all_sections(), False, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs)
             partial = True
         results.sort(key=lambda r: (-r[2], -r[1], -r[0]))
         # a weak result set (empty, partial-fallback, or a low top score) is the signal

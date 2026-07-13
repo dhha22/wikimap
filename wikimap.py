@@ -101,7 +101,7 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 
 MIGRATE_SKILL = r"""---
 name: graphify-to-wikimap
-description: Migrate a knowledge vault from graphify (build-time LLM knowledge graph) to wikimap (zero-LLM incremental index). Use when a vault has a graphify-out/ directory, a graphify graph.json, or graphify-specific config/rules, and the user wants to switch to wikimap. Removes graphify artifacts, optionally imports graphify's inferred edges (hash-pinned), reindexes with wikimap, and updates operating rules. Do not use for the initial wikimap setup of a vault that never used graphify — that is just `wikimap update`.
+description: Migrate a knowledge vault from graphify (build-time LLM knowledge graph) to wikimap (zero-LLM incremental index). Use when a vault has a graphify-out/ directory, a graphify graph.json, or graphify-specific config/rules, and the user wants to switch to wikimap. Drives `wikimap migrate` (which imports graphify's inferred edges, removes its artifacts, and reindexes — dry run by default), then switches the vault's operating rules and git config over. Do not use for the initial wikimap setup of a vault that never used graphify — that is just `wikimap update`.
 ---
 
 # Migrate graphify → wikimap

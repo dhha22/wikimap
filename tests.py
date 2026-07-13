@@ -1025,6 +1025,24 @@ class TestInstallMultiTarget(unittest.TestCase):
         self.assertTrue((self.tmp / ".claude" / "skills" / "wikimap" / "SKILL.md").exists())
         self.assertTrue((self.tmp / ".agents" / "skills" / "wikimap" / "SKILL.md").exists())
 
+    def test_ships_the_migration_skill_alongside(self):
+        self.install()
+        for base in (".claude", ".agents"):
+            p = self.tmp / base / "skills" / "graphify-to-wikimap" / "SKILL.md"
+            self.assertTrue(p.exists(), base)
+            text = p.read_text(encoding="utf-8")
+            self.assertIn("name: graphify-to-wikimap", text)
+            # 스킬이 낡은 수동 절차가 아니라 실제 명령어를 안내해야 한다
+            self.assertIn("wikimap migrate", text)
+
+    def test_migration_skill_customizations_are_preserved(self):
+        p = self.tmp / ".claude" / "skills" / "graphify-to-wikimap" / "SKILL.md"
+        p.parent.mkdir(parents=True)
+        custom = "# my migration notes\n"
+        p.write_text(custom, encoding="utf-8")
+        self.install()
+        self.assertEqual(p.read_text(encoding="utf-8"), custom)
+
 
 class TestInstallAgentsMd(unittest.TestCase):
     def setUp(self):

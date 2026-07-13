@@ -127,7 +127,14 @@ wikimap is not tied to one assistant. The core is a plain CLI (`--json` on every
 - **Cursor and other tools that read `AGENTS.md`** — `wikimap install --agents-md` inserts a marker-delimited usage block into `./AGENTS.md` (idempotent: re-running refreshes the block and never touches your other content).
 - **Everything else** — any agent that can run a shell command can use `wikimap search/links/path/suggest ... --json` directly; the skill file is just a usage manual, not a runtime dependency.
 
-Customize freely: edit the installed `SKILL.md` (your vault path, language, house rules) — upgrades never overwrite an existing `SKILL.md`, only the tool itself. That preservation is gated by tests.
+**Two skills get installed**, and your agent picks the right one on its own:
+
+| Skill | Your agent reaches for it when… |
+|---|---|
+| `wikimap` | you ask a question about the vault, or edit it and it needs reindexing |
+| `graphify-to-wikimap` | it spots a `graphify-out/` directory and you want off graphify — it drives `wikimap migrate` and then fixes up the rules and git config the command can't touch |
+
+Customize freely: edit the installed `SKILL.md` (your vault path, language, house rules) — upgrades never overwrite an existing `SKILL.md`, only the tool itself. Both skills are preserved that way, and it's gated by tests.
 
 ## What it looks like
 
@@ -186,6 +193,8 @@ One command: it imports the connections graphify inferred, deletes graphify's ar
 The ordering matters and the command gets it right: **edges are imported before `graph.json` is deleted.** Do it by hand in the wrong order and those connections are gone for good. Imported edges come out *better* than they went in — each is pinned to both documents' content hashes, so it goes stale on its own when either doc changes, which graphify's graph never did.
 
 Want a clean break instead? `--apply --no-import` throws the old edges away; `suggest` can rebuild candidates from scratch, deterministically and for free.
+
+Or just tell your agent *"migrate this vault off graphify"* — `wikimap install` ships a `graphify-to-wikimap` skill that runs the command for you, then handles the parts it can't: repointing your `CLAUDE.md`/`AGENTS.md` rules at wikimap, and untracking the artifacts from git.
 
 ## How connections get discovered without an LLM
 

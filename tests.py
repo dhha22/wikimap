@@ -1192,5 +1192,60 @@ class TestParserVersionRescan(VaultTest):
         self.assertIn("profile/resume-ja.md", run(self.root, "search", "일본어 경력기술서"))
 
 
+class TestMigrateFromGraphify(VaultTest):
+    def setUp(self):
+        super().setUp()
+        graph = {
+            "nodes": [
+                {"id": "n1", "label": "session expiry", "source_file": "specs/auth-spec.md"},
+                {"id": "n2", "label": "auth plan", "source_file": "plans/auth-plan.md"},
+            ],
+            "links": [{"source": "n1", "target": "n2",
+                       "confidence": "INFERRED", "relation": "implements"}],
+        }
+        write(self.root, "graphify-out/graph.json", json.dumps(graph))
+        write(self.root, "graphify-out/cache/blob.bin", "cached junk")
+        write(self.root, ".graphifyignore", "node_modules\n")
+        # 이름에 graphify가 들어가지만 사용자가 쓴 문서 — 절대 지워지면 안 된다
+        write(self.root, "notes/why-we-left-graphify.md", "# graphify 회고\n\n내가 쓴 문서.")
+        run(self.root, "update")
+
+    def test_dry_run_writes_nothing(self):
+        out = run(self.root, "migrate")
+        self.assertIn("dry run", out)
+        self.assertIn("graphify-out/", out)
+        self.assertIn(".graphifyignore", out)
+        self.assertTrue((self.root / "graphify-out/graph.json").exists())
+        self.assertTrue((self.root / ".graphifyignore").exists())
+
+    def test_apply_imports_edges_before_deleting_the_graph(self):
+        out = run(self.root, "migrate", "--apply")
+        self.assertIn("imported 1 doc-pair edges", out)
+        self.assertFalse((self.root / "graphify-out").exists())
+        self.assertFalse((self.root / ".graphifyignore").exists())
+        # graph.json 이 지워졌어도 엣지는 살아 있어야 한다 (순서가 뒤집히면 영구 유실)
+        edges = run(self.root, "edges")
+        self.assertIn("graphify-import", edges)
+        self.assertIn("specs/auth-spec.md", edges)
+        self.assertIn("plans/auth-plan.md", edges)
+
+    def test_never_deletes_user_authored_files(self):
+        run(self.root, "migrate", "--apply")
+        keep = self.root / "notes/why-we-left-graphify.md"
+        self.assertTrue(keep.exists(), "filename containing 'graphify' is not an artifact")
+        self.assertTrue((self.root / "specs/auth-spec.md").exists())
+
+    def test_no_import_discards_edges(self):
+        out = run(self.root, "migrate", "--no-import", "--apply")
+        self.assertNotIn("imported", out)
+        self.assertFalse((self.root / "graphify-out").exists())
+        self.assertNotIn("graphify-import", run(self.root, "edges"))
+
+    def test_idempotent_when_nothing_to_migrate(self):
+        run(self.root, "migrate", "--apply")
+        out = run(self.root, "migrate")
+        self.assertIn("no graphify artifacts found", out)
+
+
 if __name__ == "__main__":
     unittest.main()

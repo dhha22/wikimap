@@ -169,11 +169,23 @@ Everything else, grouped by what it's for:
 | **Housekeeping** | `mv <old> <new>` | Rename a doc and rewrite every link pointing at it |
 | | `fix-links` | Suggest targets for broken links (never auto-applies) |
 | | `install` | Register as an agent skill, or `--hook` to auto-`update` on every commit |
+| | `migrate` | Move a graphify vault over in one command (see below). Dry run unless `--apply` |
 
 Anything cached — a note, an edge, an embedding — is **pinned to the source file's content hash**. Edit that file and the cached knowledge goes stale and drops out on its own, instead of feeding your agent a stale fact.
 
 Every query command takes `--json`. Run `wikimap <command> --help` for the full flags: phrase/field/type filters, context lines, ignore rules, and the rest.
-Migrating from graphify? `import-graphify <graph.json>` carries your existing inferred edges over.
+### Coming from graphify?
+
+```bash
+wikimap migrate            # shows you exactly what it'll do
+wikimap migrate --apply    # does it
+```
+
+One command: it imports the connections graphify inferred, deletes graphify's artifacts (`graphify-out/`, `.graphifyignore`), and reindexes. **Your documents are never touched** — and a file *you* wrote called `why-we-left-graphify.md` is content, not an artifact, so it stays.
+
+The ordering matters and the command gets it right: **edges are imported before `graph.json` is deleted.** Do it by hand in the wrong order and those connections are gone for good. Imported edges come out *better* than they went in — each is pinned to both documents' content hashes, so it goes stale on its own when either doc changes, which graphify's graph never did.
+
+Want a clean break instead? `--apply --no-import` throws the old edges away; `suggest` can rebuild candidates from scratch, deterministically and for free.
 
 ## How connections get discovered without an LLM
 

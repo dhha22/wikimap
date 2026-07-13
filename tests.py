@@ -512,6 +512,51 @@ class TestJsonOutput(VaultTest):
         self.assertIn("candidates", json.loads(run(self.root, "suggest", "--json")))
 
 
+class TestFanOutSearch(VaultTest):
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def test_single_query_json_shape_unchanged(self):
+        d = json.loads(run(self.root, "search", "세션", "--json"))
+        self.assertEqual(d["query"], "세션")
+        self.assertNotIn("fused", d)
+        self.assertNotIn("queries", d)
+
+    def test_terms_report_df_per_token(self):
+        d = json.loads(run(self.root, "search", "세션 파랑나비", "--json"))
+        df = {t["term"]: t["df"] for t in d["terms"]}
+        self.assertGreaterEqual(df["세션"], 1)
+        self.assertEqual(df["파랑나비"], 0)
+
+    def test_dead_terms_hint_in_human_output(self):
+        out = run(self.root, "search", "파랑나비")
+        self.assertIn("no results", out)
+        self.assertIn("no corpus hits for: 파랑나비", out)
+
+    def test_fusion_unions_docs_across_phrasings(self):
+        # each phrasing alone reaches a different doc; the fused ranking has both
+        d = json.loads(run(self.root, "search", "결제 위젯", "billing widgets", "--json"))
+        self.assertTrue(d["fused"])
+        self.assertEqual([q["query"] for q in d["queries"]], ["결제 위젯", "billing widgets"])
+        paths = [r["path"] for r in d["results"]]
+        self.assertIn("notes/orphan-note.md", paths)
+        self.assertIn("notes/readme.txt", paths)
+
+    def test_fusion_prefers_agreement(self):
+        d = json.loads(run(self.root, "search", "세션 만료", "로그인 정책", "--json"))
+        top = d["results"][0]
+        self.assertEqual(top["path"], "specs/auth-spec.md")
+        self.assertEqual(top["sources"], "2/2")
+
+    def test_fused_per_query_terms_feedback(self):
+        d = json.loads(run(self.root, "search", "세션 파랑나비", "세션 만료", "--json"))
+        q0 = d["queries"][0]
+        self.assertEqual({t["term"]: t["df"] for t in q0["terms"]}["파랑나비"], 0)
+        df1 = {t["term"]: t["df"] for t in d["queries"][1]["terms"]}
+        self.assertTrue(all(v >= 1 for v in df1.values()), df1)
+
+
 class TestQueryLanguage(VaultTest):
     def setUp(self):
         super().setUp()

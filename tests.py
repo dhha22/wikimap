@@ -931,6 +931,33 @@ class TestInstallPreservesSkill(unittest.TestCase):
         skill = tmp / ".claude" / "skills" / "wikimap" / "SKILL.md"
         self.assertIn("name: wikimap", skill.read_text(encoding="utf-8"))
 
+    def test_fresh_install_writes_migration_skill(self):
+        tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = dict(os.environ, HOME=str(tmp), USERPROFILE=str(tmp))
+        r = subprocess.run(
+            [sys.executable, WIKIMAP, "install"],
+            capture_output=True, text=True, encoding="utf-8", env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        migrate = tmp / ".claude" / "skills" / "graphify-to-wikimap" / "SKILL.md"
+        self.assertIn("name: graphify-to-wikimap", migrate.read_text(encoding="utf-8"))
+
+    def test_existing_migration_skill_untouched(self):
+        tmp = Path(tempfile.mkdtemp(prefix="wikimap-home-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        mig_dir = tmp / ".claude" / "skills" / "graphify-to-wikimap"
+        mig_dir.mkdir(parents=True)
+        custom = "# my customized migration SKILL — do not touch\n"
+        (mig_dir / "SKILL.md").write_text(custom, encoding="utf-8")
+        env = dict(os.environ, HOME=str(tmp), USERPROFILE=str(tmp))
+        r = subprocess.run(
+            [sys.executable, WIKIMAP, "install"],
+            capture_output=True, text=True, encoding="utf-8", env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((mig_dir / "SKILL.md").read_text(encoding="utf-8"), custom)
+
     def test_install_from_console_script_like_pipx(self):
         # a pipx/uv install runs `import wikimap; wikimap.main()` with the module
         # living in a venv's site-packages — install must still copy itself and

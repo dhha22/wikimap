@@ -97,6 +97,43 @@ Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable
 9. **Semantic search for natural-language questions** (the language-agnostic path, when keyword search comes up `weak` and reformulation doesn't help): keyword matching is substring-based, so a conversational question that shares no exact terms with the doc ("how is the impression flag reset?" vs a doc titled "노출 트래킹") won't match by keyword in any language. If an embedding index exists, generate a query embedding **yourself** (any embedding model — wikimap is model-agnostic) and either run `semsearch --vector <json>` for a pure semantic ranking, or `search "<q>" --hybrid <json>` to blend it with keyword hits in a single call (docs found by both signals rank highest). To make docs searchable this way, embed them once: for each doc `embed set <path> --vector <json>` with a vector you generate; `embed status` shows what's missing or stale. wikimap only stores and cosine-ranks — the vectors, and the cost, are yours and scale with what you embed, not with build time.
 """
 
+MIGRATE_SKILL = r"""---
+name: graphify-to-wikimap
+description: Migrate a knowledge vault from graphify (build-time LLM knowledge graph) to wikimap (zero-LLM incremental index). Use when a vault has a graphify-out/ directory, a graphify graph.json, or graphify-specific config/rules, and the user wants to switch to wikimap. Removes graphify artifacts, optionally imports graphify's inferred edges (hash-pinned), reindexes with wikimap, and updates operating rules. Do not use for the initial wikimap setup of a vault that never used graphify — that is just `wikimap update`.
+---
+
+# Migrate graphify → wikimap
+
+graphify extracts a knowledge graph with an LLM **at build time**; wikimap indexes the same vault deterministically with **no build-time LLM**. The vault's source documents are identical for both tools — migration removes graphify's *artifacts and config*, not your content, then builds a wikimap index over the same files.
+
+**Ground rule: never touch source content.** graphify-out/ and .graphifyignore are artifacts (delete them). A `foo-graphify-benchmark.md` you wrote, or a `graphify-graph.png`, is content (keep it — a filename containing "graphify" does not make it an artifact). When unsure whether a file is an artifact, ask before deleting.
+
+## Steps
+
+1. **Survey what graphify left behind.** From the vault root:
+   - artifacts/config to remove: `graphify-out/` directories (there may be several, e.g. under subfolders), `.graphifyignore` files, `graphify-out/cache/` lines in `.gitignore`, and any `graph.json` graphify produced.
+   - content to keep: prose `.md`/images whose *content* is about graphify but which you authored.
+   List both sets and confirm the delete set with the user before removing anything.
+
+2. **(Optional) Import graphify's inferred edges first — do this BEFORE deleting graph.json.** If you want to preserve the connections graphify inferred, run `wikimap import-graphify <path/to/graph.json>` once. It pulls only INFERRED links, dedupes them to document pairs, and pins each to both endpoints' content hashes (so an edge goes stale automatically when either file changes — a freshness guarantee graphify's own graph lacks). Skip this step if the user wants a clean break with no imported edges; wikimap's own `suggest` can regenerate link candidates deterministically later. Confirm which the user wants — importing is not always desired.
+
+3. **Remove the graphify artifacts** identified in step 1 (delete the directories/files; `git rm` them if tracked). Leave content untouched.
+
+4. **Reindex with wikimap.** From the vault root: `wikimap update`. This builds `.wikimap/index.db` and writes `MAP.md` (the agent entry point) over the same source files — sub-second, zero tokens. Verify: `MAP.md` and the index no longer reference any `graphify-out` path.
+
+5. **Switch the operating rules.** graphify-based vaults usually have rules that point agents at graphify. Update them to wikimap, wherever they live (a `CLAUDE.md`, `AGENTS.md`, an editor hook, a skill file):
+   - navigation order: read `MAP.md` first, then `wikimap search "<q>" --json`, then open the doc — replacing "read graphify-out/GRAPH_REPORT.md first".
+   - after editing vault files, run `wikimap update` (not a graphify rebuild).
+   - if a rule triggered on `graphify-out/graph.json` existing, retrigger it on `MAP.md` existing instead.
+   `wikimap install --agents-md` can drop a maintained usage block into `AGENTS.md` idempotently.
+
+6. **Note the storage model** so nothing important gets gitignored by accident: `.wikimap/index.db` is a disposable cache (safe to gitignore — `update` rebuilds it), while `.wikimap/semantics.jsonl` is the source of truth for notes and edges (commit it).
+
+## Reversibility
+
+Removing graphify is low-risk: source documents are never modified. To undo a wikimap index entirely, delete `.wikimap/` and `MAP.md` — no trace remains. To undo the edge import specifically, remove the `origin: graphify-import` lines from `.wikimap/semantics.jsonl` and run `wikimap update`.
+"""
+
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
 WIKILINK = re.compile(r"\[\[([^\]|#]+)")
 MDLINK = re.compile(r"\]\(([^)#\s]+\.md)\)")
@@ -2730,6 +2767,13 @@ def cmd_install(args):
             skill.write_text(SKILL_TEMPLATE.replace("__WIKIMAP__", f"python3 {tool}"),
                              encoding="utf-8")
             print(f"wrote {skill}")
+        migrate = dest.parent / "graphify-to-wikimap" / "SKILL.md"
+        if migrate.exists():
+            print(f"kept existing {migrate} (customizations preserved)")
+        else:
+            migrate.parent.mkdir(parents=True, exist_ok=True)
+            migrate.write_text(MIGRATE_SKILL, encoding="utf-8")
+            print(f"wrote {migrate}")
         print(f"installed wikimap {VERSION} to {dest}")
     print("next: cd <your-vault> && wikimap update")
 

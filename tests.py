@@ -147,6 +147,48 @@ class TestSearch(VaultTest):
         self.assertIn("notes/readme.txt", run(self.root, "search", "billing widgets"))
 
 
+class TestEvidenceLines(VaultTest):
+    """matched lines are picked doc-wide by idf mass, not first-3 in the top section."""
+
+    def setUp(self):
+        super().setUp()
+        write(self.root, "kb/rollout.md", "\n".join([
+            "# rollout", "",
+            "## overview",
+            "the gadget rollout plan covers the gadget gates and gadget owners",
+            "gadget rollout timing is standard",
+            "",
+            "## decision tally",
+            "| gadget tally | 30 approved |",
+        ]))
+        run(self.root, "update")
+
+    def result_for(self, data, path):
+        return next(r for r in data["results"] if r["path"] == path)
+
+    def test_matched_includes_answer_line_from_another_section(self):
+        data = json.loads(run(self.root, "search", "gadget tally", "--json"))
+        r = self.result_for(data, "kb/rollout.md")
+        self.assertTrue(any("30 approved" in m for m in r["matched"]),
+                        "the answer line lives outside the best-scoring section — "
+                        "matched must scan the whole doc (v8: 25/28 evidence misses)")
+
+    def test_highest_idf_mass_line_comes_first(self):
+        data = json.loads(run(self.root, "search", "gadget tally", "--json"))
+        r = self.result_for(data, "kb/rollout.md")
+        self.assertIn("tally", r["matched"][0],
+                      "a line carrying both terms (rare 'tally' included) must outrank "
+                      "lines that only echo the common term")
+
+    def test_matched_caps_at_five_lines(self):
+        write(self.root, "kb/noisy.md", "# noisy\n\n" +
+              "\n".join(f"gadget line {i}" for i in range(8)) + "\n")
+        run(self.root, "update")
+        data = json.loads(run(self.root, "search", "gadget", "--json"))
+        r = self.result_for(data, "kb/noisy.md")
+        self.assertLessEqual(len(r["matched"]), 5)
+
+
 class TestLinksAndTrustTags(VaultTest):
     def setUp(self):
         super().setUp()
@@ -697,6 +739,55 @@ class TestSemanticsRoundtrip(VaultTest):
                          "must reproduce notes/edges/embeds exactly")
 
 
+class TestDoctor(VaultTest):
+    def setUp(self):
+        super().setUp()
+        write(self.root, "specs/auth-spec.md", "\n".join([
+            "# 인증 스펙", "",
+            "## 로그인 정책", "REQ-01 세션 만료는 30분. 담당은 [[auth-plan]] 참고.",
+        ]))
+        run(self.root, "update")
+
+    def doctor(self):
+        return json.loads(run(self.root, "doctor", "--json"))
+
+    def test_clean_vault_is_healthy(self):
+        d = self.doctor()
+        self.assertTrue(d["healthy"])
+        self.assertEqual(d["links"]["broken"], 0)
+        self.assertEqual(d["index"]["pending"], 0)
+        self.assertIn("healthy", run(self.root, "doctor"))
+
+    def test_detects_index_behind_disk(self):
+        write(self.root, "notes/new-doc.md", "# new\n\nnot yet indexed\n")
+        d = self.doctor()
+        self.assertGreaterEqual(d["index"]["pending"], 1)
+        self.assertFalse(d["healthy"])
+
+    def test_detects_stale_pins_and_broken_links(self):
+        run(self.root, "note", "add", "--question", "q", "--insight", "i",
+            "--sources", "specs/auth-spec.md")
+        write(self.root, "specs/auth-spec.md",
+              "# 인증 스펙\n\nedited — note goes stale. also [[ghost-doc]]\n")
+        run(self.root, "update")
+        d = self.doctor()
+        self.assertEqual(d["stale"]["notes"], 1)
+        self.assertEqual(d["links"]["broken"], 1)
+        self.assertFalse(d["healthy"])
+
+    def test_counts_malformed_and_unknown_semantics_lines(self):
+        run(self.root, "note", "add", "--question", "q", "--insight", "i",
+            "--sources", "specs/auth-spec.md")
+        with (self.root / ".wikimap" / "semantics.jsonl").open("a", encoding="utf-8") as f:
+            f.write("this is not json\n")
+            f.write(json.dumps({"type": "cluster-from-the-future"}) + "\n")
+        d = self.doctor()
+        self.assertEqual(d["semantics"]["malformed"], 1)
+        self.assertEqual(d["semantics"]["unknown_types"], 1)
+        self.assertFalse(d["healthy"], "a malformed line is an issue")
+        self.assertEqual(d["semantics"]["by_type"].get("note"), 1)
+
+
 class TestRoundtripProperty(unittest.TestCase):
     """Randomized op sequences over a clean vault: wikimap's own writes must never
     stale a pin, prune must never delete anything, and no link may break."""
@@ -728,6 +819,8 @@ class TestRoundtripProperty(unittest.TestCase):
         status = run(root, "embed", "status")
         self.assertNotIn("stale", status)
         self.assertEqual(json.loads(run(root, "fix-links", "--json"))["broken"], [])
+        d = json.loads(run(root, "doctor", "--json"))
+        self.assertTrue(d["healthy"], d)
 
     def drive(self, seed):
         rng = random.Random(seed)

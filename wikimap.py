@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -61,7 +61,7 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | Command | Purpose |
 |---------|---------|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
-| `search "query" ["variant" ...] [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows matched lines (≤3); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard). **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — a doc multiple phrasings agree on wins |
+| `search "query" ["variant" ...] [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows the best-matching lines from the *whole* document (≤5, so the answer line surfaces even when it lives outside the top-scoring section); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard). **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — a doc multiple phrasings agree on wins |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
@@ -79,8 +79,9 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `install --hook` | git post-commit hook that runs `update` automatically (appends to an existing hook) |
 | `mv <old> <new> [--apply]` | move/rename a doc AND rewrite every wikilink/md/img reference to it (dry run without `--apply`); semantics.jsonl paths updated too |
 | `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied) |
+| `doctor [--json]` | read-only integrity check in one shot: index freshness (behind disk?), `semantics.jsonl` validity, broken links, stale pins — ends with the command that fixes each finding. Run it when a vault behaves oddly |
 
-`search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the result set is empty, fell back to a partial match, or has a low top score — the signal to try the semantic path (see rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus. A `df: 0` term is dead vocabulary (nothing in the vault contains it): when reformulating, replace exactly those terms and keep the ones that hit.
+`search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch`/`doctor` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the result set is empty, fell back to a partial match, or has a low top score — the signal to try the semantic path (see rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus. A `df: 0` term is dead vocabulary (nothing in the vault contains it): when reformulating, replace exactly those terms and keep the ones that hit.
 
 Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable — the source of truth); `.wikimap/index.db` is a disposable cache rebuilt from files + that jsonl.
 
@@ -2190,18 +2191,72 @@ def cmd_search(root, db, args):
         weak = all(r["weak"] for r in ranked)
         plain = first["plain"]
 
-    # highlight on the term variants actually matched, not the raw tokens — a
-    # particle-suffixed query token ('컴포넌트들') should still light up its stem
-    hl = {v for r in ranked for t in r["plain"] for v in r["pvariants"][t]}
     dead = [t for t in first["plain"] if first["df"].get(t, 0) == 0]
+
+    shown = results[: args.n]
+    # the answer line often lives outside the best-scoring section (v8 bench: 25/28
+    # evidence misses) — candidate lines come from the whole doc, best lines win the cap.
+    # matching is on term variants, not raw tokens — a particle-suffixed query token
+    # ('컴포넌트들') should still light up its stem
+    var_by_term = {}
+    for r in ranked:
+        for t in r["plain"]:
+            var_by_term.setdefault(t, set()).update(r["pvariants"][t])
+    flat_hl = sorted({v for vs in var_by_term.values() for v in vs}, key=len, reverse=True)
+    hl_re = re.compile("|".join(re.escape(v) for v in flat_hl)) if flat_hl else None
+    ndocs = max(1, db.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    df_by_term = {}
+    for r in ranked:
+        for t in r["plain"]:
+            df_by_term.setdefault(t, r["df"].get(t, 0))
+    idf_by_term = {t: math.log(ndocs / df) if df else math.log(ndocs)
+                   for t, df in df_by_term.items()}
+    doc_lines, doc_cands = {}, {}
+    plist = sorted({r[3] for r in shown})
+    for i in range(0, len(plist), 500):
+        chunk = plist[i:i + 500]
+        secs = {}
+        for p, sline, content in db.execute(
+                "SELECT path, line, content FROM sections WHERE path IN (%s)"
+                % ",".join("?" * len(chunk)), chunk):
+            secs.setdefault(p, []).append((sline, content))
+        for p, srows in secs.items():
+            dlines = [ln for _, c in sorted(srows) for ln in c.splitlines()]
+            doc_lines[p] = dlines
+            cands = []
+            for order, ln in enumerate(dlines):
+                low = ln.lower()
+                if hl_re is None or not hl_re.search(low):
+                    continue
+                idfsum = sum(idf_by_term.get(t, 0) for t, vs in var_by_term.items()
+                             if any(v in low for v in vs))
+                cands.append((idfsum, order, ln))
+            doc_cands[p] = cands
+
+    # a line is a mini-doc: rank by matched idf mass (same principle as sections),
+    # prefer the displayed section on ties, then document order
+    def pick_lines(path, section_content, limit=5):
+        own = {ln.strip() for ln in section_content.splitlines()}
+        ranked_lines = sorted(
+            doc_cands.get(path, ()),
+            key=lambda c: (-c[0], 0 if c[2].strip() in own else 1, c[1]))
+        out, seen = [], set()
+        for _, order, ln in ranked_lines:
+            s = ln.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append((order, s))
+            if len(out) == limit:
+                break
+        return out
 
     if args.json:
         out = []
-        for nmatched, midf, score, path, line, heading, content in results[: args.n]:
-            lines = content.splitlines()
-            hits = [ln.strip() for ln in lines if any(t in ln.lower() for t in hl)]
+        for nmatched, midf, score, path, line, heading, content in shown:
+            hits = [s for _, s in pick_lines(path, content)]
             rec = {"path": path, "line": line, "heading": heading,
-                   "score": round(score, 4 if fused else 2), "matched": hits[:3]}
+                   "score": round(score, 4 if fused else 2), "matched": hits}
             if fused:
                 rec["sources"] = f"{nsources[path]}/{nvotes}"
             if path in sem_ranks:
@@ -2229,7 +2284,7 @@ def cmd_search(root, db, args):
         if dead:
             print(f"~ no corpus hits for: {', '.join(dead)} — swap these for document vocabulary")
         return
-    for nmatched, midf, score, path, line, heading, content in results[: args.n]:
+    for nmatched, midf, score, path, line, heading, content in shown:
         if fused:
             tag = f"rrf {score:.4f}, {nsources[path]}/{nvotes} queries"
         elif partial:
@@ -2239,25 +2294,25 @@ def cmd_search(root, db, args):
         if path in sem_ranks:
             tag += f", cos {sem_ranks[path][1]:.3f}"
         print(f"{path}:{line}  [{heading}]  ({tag})")
-        lines = content.splitlines()
         if args.full:
-            for ln in lines:
+            for ln in content.splitlines():
                 print(f"  {ln.rstrip()}")
             continue
-        hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in hl)]
+        picked = pick_lines(path, content)
         if args.context:
-            shown = set()
-            for i in hits:
-                shown.update(range(max(0, i - args.context), min(len(lines), i + args.context + 1)))
+            dlines = doc_lines.get(path) or content.splitlines()
+            ctx = set()
+            for i, _ in picked:
+                ctx.update(range(max(0, i - args.context), min(len(dlines), i + args.context + 1)))
             prev = None
-            for j in sorted(shown):
+            for j in sorted(ctx):
                 if prev is not None and j > prev + 1:
                     print("  ⋯")
-                print(f"  {lines[j].rstrip()[:200]}")
+                print(f"  {dlines[j].rstrip()[:200]}")
                 prev = j
         else:
-            for i in hits[:3]:
-                print(f"  {lines[i].strip()[:160]}")
+            for _, s in picked:
+                print(f"  {s[:160]}")
     if weak and dead:
         print(f"~ no corpus hits for: {', '.join(dead)} — swap these for document vocabulary")
 
@@ -2793,6 +2848,88 @@ def cmd_fix_links(root, db, args):
           "`wikimap mv` next time you relocate a file.")
 
 
+def cmd_doctor(root, db, args):
+    patterns = load_ignore_patterns(root, None)
+    map_rel = map_setting(db)
+    skip_rels = frozenset({map_rel} if map_rel != MAP_DISABLED else ())
+    known = {p: mt for p, mt in db.execute("SELECT path, mtime FROM files")}
+    seen, pending = set(), 0
+    for p in scan_files(root, None, patterns, skip_rels):
+        rel = p.relative_to(root).as_posix()
+        seen.add(rel)
+        mt = known.get(rel)
+        if mt is None or abs(mt - p.stat().st_mtime) >= 1e-6:
+            pending += 1
+    deleted = len(set(known) - seen)
+
+    sem_p = semantics_path(root)
+    total_lines = malformed = unknown = 0
+    by_type = {}
+    if sem_p.is_file():
+        for ln in sem_p.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            total_lines += 1
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                malformed += 1
+                continue
+            if not isinstance(r, dict) or not isinstance(r.get("type"), str):
+                malformed += 1
+                continue
+            t = r["type"]
+            by_type[t] = by_type.get(t, 0) + 1
+            if t not in ("note", "edge", "embed"):
+                unknown += 1
+
+    h = vault_health(db)
+    files = {p: s for p, s in db.execute("SELECT path, sha FROM files")}
+    stale_embeds = sum(1 for p, s in db.execute("SELECT path, sha FROM embeds")
+                       if p in files and files[p] != s)
+
+    issues = []
+    if pending or deleted:
+        issues.append(f"index behind disk: {pending} changed/new, {deleted} deleted "
+                      "— run `wikimap update`")
+    if malformed:
+        issues.append(f"{malformed} malformed line(s) in semantics.jsonl "
+                      "— those records are invisible until the line is fixed")
+    if h["broken"]:
+        issues.append(f"{len(h['broken'])} broken link(s) — see `wikimap fix-links`")
+    if h["stale_notes"] or h["stale_edges"] or stale_embeds:
+        issues.append(f"stale pins: {h['stale_notes']} notes, {h['stale_edges']} edges, "
+                      f"{stale_embeds} embeds — re-verify and repin, or prune")
+
+    if args.json:
+        print(json.dumps({
+            "index": {"files": len(files), "pending": pending, "deleted": deleted},
+            "semantics": {"lines": total_lines, "malformed": malformed,
+                          "by_type": by_type, "unknown_types": unknown},
+            "links": {"broken": len(h["broken"]), "orphans": len(h["orphans"])},
+            "stale": {"notes": h["stale_notes"], "edges": h["stale_edges"],
+                      "embeds": stale_embeds},
+            "healthy": not issues,
+        }, ensure_ascii=False, indent=2))
+        return
+    print(f"index    : {len(files)} files"
+          + (f", {pending} changed/new + {deleted} deleted pending update"
+             if pending or deleted else " — up to date"))
+    print(f"semantics: {total_lines} record line(s)"
+          + (f", {malformed} malformed" if malformed else "")
+          + (f", {unknown} from a newer wikimap (kept as-is)" if unknown else ""))
+    print(f"links    : {len(h['broken'])} broken, {len(h['orphans'])} orphan doc(s)")
+    print(f"stale    : {h['stale_notes']} notes, {h['stale_edges']} edges, "
+          f"{stale_embeds} embeds")
+    if issues:
+        print("attention:")
+        for i in issues:
+            print(f"  - {i}")
+    else:
+        print("healthy — nothing to do")
+
+
 def install_hook(root: Path):
     git_dir = root / ".git"
     if not git_dir.is_dir():
@@ -3032,6 +3169,10 @@ def main():
     fl = sub.add_parser("fix-links", help="suggest targets for broken links (suggestions only)")
     fl.add_argument("--json", action="store_true", help="structured output for agents/scripts")
 
+    dr = sub.add_parser("doctor", help="read-only integrity check: index freshness, "
+                                       "semantics validity, broken links, stale pins")
+    dr.add_argument("--json", action="store_true", help="structured output for agents/scripts")
+
     lk = sub.add_parser("link", help="insert a [[wikilink]] into a doc's link-list section "
                                      "(idempotent; dry run by default)")
     lk.add_argument("action", choices=["add"])
@@ -3128,6 +3269,8 @@ def main():
             cmd_mv(root, db, args)
         elif args.cmd == "fix-links":
             cmd_fix_links(root, db, args)
+        elif args.cmd == "doctor":
+            cmd_doctor(root, db, args)
         elif args.cmd == "link":
             cmd_link_add(root, db, args)
         elif args.cmd == "note":

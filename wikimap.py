@@ -29,11 +29,11 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 
 IGNORE_DIRS = {
     ".obsidian", ".git", ".wikimap", "graphify-out", "node_modules",
@@ -140,7 +140,7 @@ Source documents are never modified. To undo the wikimap index entirely, delete 
 
 HEADING = re.compile(r"^(#{1,6})\s+(.*)")
 WIKILINK = re.compile(r"\[\[([^\]|#]+)")
-MDLINK = re.compile(r"\]\(([^)#\s]+\.md)\)")
+MDLINK = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)\s]*)?\)")
 IMGLINK = re.compile(r"!\[([^\]]*)\]\(([^)#\s]+)\)")
 CODEREF = re.compile(r"\b[\w/.-]*\w\.(?:kt|kts|swift|java|py|ts|tsx|gradle)\b")
 REQID = re.compile(r"\bREQ-\d+\b")
@@ -1084,6 +1084,31 @@ def write_semantics(root: Path, recs):
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs), encoding="utf-8"
     )
     tmp.replace(p)
+
+
+def repin_rewritten(sem, resha):
+    # when wikimap itself rewrites a doc's bytes (mv link fixes, link add inserts), records
+    # pinned to the pre-edit content would go stale — and a routine --prune would delete
+    # them. Repin to the new bytes, but only pins that matched the pre-edit content:
+    # already-stale must stay stale.
+    def repin(holder, pathkey, shakey):
+        pair = resha.get(holder.get(pathkey))
+        if pair and holder.get(shakey) == pair[0]:
+            holder[shakey] = pair[1]
+            return 1
+        return 0
+
+    changed = 0
+    for r in sem:
+        if r["type"] == "note":
+            for s in r.get("sources", []):
+                changed += repin(s, "path", "sha")
+        elif r["type"] == "embed":
+            changed += repin(r, "path", "sha")
+        elif r["type"] == "edge":
+            changed += repin(r, "src", "src_sha")
+            changed += repin(r, "dst", "dst_sha")
+    return changed
 
 
 def append_semantics(root: Path, rec):
@@ -2414,8 +2439,9 @@ def cmd_embed(root, db, args):
             dim = len(arr)
             break
     fresh = [p for p, (s, _) in embeds.items() if files.get(p) == s]
-    stale = [p for p, (s, _) in embeds.items() if p in files and files[p] != s]
-    missing = [p for p in files if p not in embeds]
+    # sorted so the report is stable across cache rebuilds (row order isn't)
+    stale = sorted(p for p, (s, _) in embeds.items() if p in files and files[p] != s)
+    missing = sorted(p for p in files if p not in embeds)
     if args.json:
         print(json.dumps({"total_docs": len(files), "embedded": len(fresh),
                           "stale": stale, "missing": missing, "dims": dim},
@@ -2504,7 +2530,7 @@ def cmd_notes(root, db, args):
         print(f"({n_stale} stale notes hidden — use --all to show, --prune to delete)")
 
 
-MDURL = re.compile(r"\]\(([^)#\s]+)\)")
+MDURL = re.compile(r"\]\(([^)#\s]+)(#[^)\s]*)?\)")
 
 
 # English standards only — language-specific conventions (관련 문서, 関連, 相关…) would
@@ -2593,7 +2619,14 @@ def cmd_link_add(root, db, args):
     if not args.apply:
         print("dry run — nothing written. Re-run with --apply to execute.")
         return
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    old_sha = sha256_of(p)
+    new_text = "\n".join(lines) + "\n"
+    p.write_text(new_text, encoding="utf-8")
+    sem = load_semantics(root)
+    if repin_rewritten(sem, {doc: (old_sha,
+                                   hashlib.sha256(new_text.encode("utf-8")).hexdigest())}):
+        write_semantics(root, sem)
+        sync_semantics(root, db)
     cmd_update(root, db, argparse.Namespace(ignore=[], map_path=None, no_map=False))
 
 
@@ -2629,6 +2662,19 @@ def cmd_mv(root, db, args):
         if target == old and src != old:
             ref_srcs.add(src)
 
+    def wiki_sub_for(counter):
+        def sub(m):
+            target = m.group(1).strip()
+            if link_stem(target) in alias_keys:
+                return m.group(0)
+            if resolve_stem(stems, target) == old:
+                repl = new_no_ext if "/" in target else new_stem
+                if repl != target:
+                    counter[0] += 1
+                    return "[[" + repl
+            return m.group(0)
+        return sub
+
     edits = []
     for src in sorted(ref_srcs):
         p = root / src
@@ -2637,27 +2683,16 @@ def cmd_mv(root, db, args):
         text = p.read_text(encoding="utf-8", errors="replace")
         n = [0]
 
-        def wiki_sub(m):
-            target = m.group(1).strip()
-            if link_stem(target) in alias_keys:
-                return m.group(0)
-            if resolve_stem(stems, target) == old:
-                repl = new_no_ext if "/" in target else new_stem
-                if repl != target:
-                    n[0] += 1
-                    return "[[" + repl
-            return m.group(0)
-
         def url_sub(m):
-            url = m.group(1)
+            url, anchor = m.group(1), m.group(2) or ""
             if url.startswith(("http://", "https://", "mailto:", "//")):
                 return m.group(0)
             if resolve_from(src, url) == old:
                 n[0] += 1
-                return "](" + norm_rel(os.path.relpath(str(root / new), str(p.parent))) + ")"
+                return "](" + norm_rel(os.path.relpath(str(root / new), str(p.parent))) + anchor + ")"
             return m.group(0)
 
-        new_text = MDURL.sub(url_sub, WIKILINK.sub(wiki_sub, text))
+        new_text = MDURL.sub(url_sub, WIKILINK.sub(wiki_sub_for(n), text))
         if n[0]:
             edits.append((src, new_text, n[0]))
 
@@ -2667,20 +2702,30 @@ def cmd_mv(root, db, args):
         text = old_abs.read_text(encoding="utf-8", errors="replace")
 
         def own_sub(m):
-            url = m.group(1)
+            url, anchor = m.group(1), m.group(2) or ""
             if url.startswith(("http://", "https://", "mailto:", "//")):
                 return m.group(0)
             target = resolve_from(old, url)
-            if (root / target).exists():
-                new_url = norm_rel(os.path.relpath(str(root / target), str(new_abs.parent)))
-                if new_url != url:
-                    own_n[0] += 1
-                    return "](" + new_url + ")"
+            if target == old:
+                target = new  # a self-link travels with the file
+            elif not (root / target).exists():
+                return m.group(0)
+            new_url = norm_rel(os.path.relpath(str(root / target), str(new_abs.parent)))
+            if new_url != url:
+                own_n[0] += 1
+                return "](" + new_url + anchor + ")"
             return m.group(0)
 
-        rewritten = MDURL.sub(own_sub, text)
+        rewritten = MDURL.sub(own_sub, WIKILINK.sub(wiki_sub_for(own_n), text))
         if own_n[0]:
             moved_text = rewritten
+
+    resha = {src: (sha256_of(root / src),
+                   hashlib.sha256(t.encode("utf-8")).hexdigest())
+             for src, t, _ in edits}
+    if moved_text is not None:
+        resha[new] = (sha256_of(old_abs),
+                      hashlib.sha256(moved_text.encode("utf-8")).hexdigest())
 
     sem = load_semantics(root)
     sem_changed = 0
@@ -2703,6 +2748,7 @@ def cmd_mv(root, db, args):
                 r["src"], r["dst"] = r["dst"], r["src"]
                 r["src_sha"], r["dst_sha"] = r.get("dst_sha"), r.get("src_sha")
             sem_changed += 1
+    sem_changed += repin_rewritten(sem, resha)
 
     print(f"mv {old} → {new}")
     for src, _, n in edits:

@@ -2,6 +2,14 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.0.2 — 2026-07-15
+
+### Fixed
+
+- **`mv` and `link add` no longer let a routine `--prune` delete records pinned to docs they rewrote.** Both commands mechanically rewrite document bytes (`mv` fixes inbound/relative links, `link add` inserts a wikilink), which silently staled every note, edge, and embedding pinned to those docs — the next `notes --prune` or `edges --prune` then deleted them. Pins that matched the pre-edit content are now repinned to the new bytes; records that were already stale stay stale.
+- **`mv` broke a document's links to itself.** Moving a doc across directories rewrote its self-links to point at the old location; renaming it left self-wikilinks and self-md-links untouched. Self-links now travel with the file.
+- **Anchored markdown links (`doc.md#section`) are now real links.** The parser and `mv` both ignored any md link with a `#` fragment: it never appeared in backlinks, and `mv` left it pointing at the old path. Anchored links are now indexed (anchor stripped) and rewritten on `mv` with the anchor preserved. Existing indexes reparse automatically (parser version bump); search rankings are unaffected — verified zero rank changes across all 290 benchmark rankings.
+
 ## 1.0.1 — 2026-07-15
 
 ### Fixed

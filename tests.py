@@ -513,6 +513,153 @@ class TestEdgeRepin(VaultTest):
         self.assertIn("stale semantics: 0 notes, 0 edges", map_md)
 
 
+class TestSemanticsRoundtrip(VaultTest):
+    """mv / prune / rebuild must never lose or silently stale a record they didn't target."""
+
+    def setUp(self):
+        super().setUp()
+        write(self.root, "aa/target.md", "# target\n\nplain content\n")
+        write(self.root, "aa/mover.md", "# mover\n\nsee [other](target.md)\n")
+        write(self.root, "bb/referrer.md", "# referrer\n\nlink: [mover](../aa/mover.md)\n")
+        run(self.root, "update")
+
+    def jsonl(self):
+        p = self.root / ".wikimap" / "semantics.jsonl"
+        return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def test_mv_repins_records_when_it_rewrites_the_referrer(self):
+        run(self.root, "edge", "add", "--src", "bb/referrer.md",
+            "--dst", "aa/target.md", "--rationale", "pinned to referrer")
+        run(self.root, "mv", "aa/mover.md", "aa/renamed.md", "--apply")
+        out = run(self.root, "edges")
+        self.assertIn("pinned to referrer", out)
+        self.assertNotIn("stale", out,
+                         "mv rewrote the referrer's link itself — records pinned to that "
+                         "doc must be repinned, or a routine --prune deletes them")
+
+    def test_mv_repins_records_when_it_rewrites_own_links(self):
+        run(self.root, "edge", "add", "--src", "aa/mover.md",
+            "--dst", "aa/target.md", "--rationale", "pinned to mover")
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/mover.md")
+        run(self.root, "embed", "set", "aa/mover.md", "--vector", "[1.0, 0.0]")
+        run(self.root, "mv", "aa/mover.md", "bb/mover.md", "--apply")
+        self.assertNotIn("stale", run(self.root, "edges"))
+        self.assertNotIn("stale", run(self.root, "notes"))
+        self.assertNotIn("stale", run(self.root, "embed", "status"))
+
+    def test_mv_does_not_resurrect_already_stale_records(self):
+        run(self.root, "edge", "add", "--src", "bb/referrer.md",
+            "--dst", "aa/target.md", "--rationale", "goes stale first")
+        write(self.root, "bb/referrer.md",
+              "# referrer\n\nedited body\n\nlink: [mover](../aa/mover.md)\n")
+        run(self.root, "update")
+        self.assertIn("1 stale edges hidden", run(self.root, "edges"))
+        run(self.root, "mv", "aa/mover.md", "aa/renamed.md", "--apply")
+        self.assertIn("1 stale edges hidden", run(self.root, "edges"),
+                      "a record stale before mv must stay stale — repin only pins that "
+                      "matched the pre-mv content")
+
+    def test_mv_carries_unknown_records_through_rewrite(self):
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/mover.md")
+        future = {"type": "cluster-from-the-future", "payload": {"x": 1}}
+        with (self.root / ".wikimap" / "semantics.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(future) + "\n")
+        run(self.root, "mv", "aa/mover.md", "bb/mover.md", "--apply")
+        self.assertIn(future, self.jsonl())
+
+    def test_mv_keeps_edge_fresh_and_sorted_when_rename_flips_order(self):
+        run(self.root, "edge", "add", "--src", "bb/referrer.md",
+            "--dst", "aa/target.md", "--rationale", "flip test")
+        run(self.root, "mv", "bb/referrer.md", "a0/referrer.md", "--apply")
+        data = json.loads(run(self.root, "edges", "--json"))
+        e = next(x for x in data["edges"] if x["rationale"] == "flip test")
+        self.assertTrue(e["fresh"])
+        self.assertLess(e["src"], e["dst"])
+        rec = next(r for r in self.jsonl() if r["type"] == "edge")
+        self.assertLess(rec["src"], rec["dst"])
+
+    def test_link_add_repins_records_pinned_to_the_edited_doc(self):
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/target.md")
+        run(self.root, "edge", "add", "--src", "aa/target.md",
+            "--dst", "aa/mover.md", "--rationale", "survives link add")
+        run(self.root, "embed", "set", "aa/target.md", "--vector", "[1.0, 0.0]")
+        run(self.root, "link", "add", "aa/target.md", "bb/referrer.md", "--apply")
+        self.assertNotIn("stale", run(self.root, "notes"))
+        self.assertNotIn("stale", run(self.root, "edges"),
+                         "link add rewrote the doc itself — pinned records must be "
+                         "repinned, or a routine --prune deletes them")
+        self.assertNotIn("stale", run(self.root, "embed", "status"))
+        run(self.root, "notes", "--prune")
+        run(self.root, "edges", "--prune")
+        types = [r["type"] for r in self.jsonl()]
+        self.assertIn("note", types)
+        self.assertIn("edge", types)
+
+    def test_notes_prune_keeps_stale_edges(self):
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/target.md")
+        run(self.root, "edge", "add", "--src", "aa/target.md",
+            "--dst", "aa/mover.md", "--rationale", "kind isolation")
+        write(self.root, "aa/target.md", "# target\n\nedited: both go stale\n")
+        run(self.root, "update")
+        run(self.root, "notes", "--prune")
+        types = [r["type"] for r in self.jsonl()]
+        self.assertNotIn("note", types)
+        self.assertIn("edge", types,
+                      "notes --prune must only remove notes — the stale edge is "
+                      "edges --prune's business")
+
+    def test_prune_compacts_a_repinned_edge_and_keeps_the_latest_pin(self):
+        run(self.root, "edge", "add", "--src", "aa/target.md",
+            "--dst", "aa/mover.md", "--rationale", "survives compaction")
+        run(self.root, "edge", "add", "--src", "aa/target.md",
+            "--dst", "bb/referrer.md", "--rationale", "left to rot")
+        write(self.root, "aa/target.md", "# target\n\nedited\n")
+        run(self.root, "update")
+        run(self.root, "edge", "repin", "--src", "aa/target.md", "--dst", "aa/mover.md")
+        self.assertEqual(len([r for r in self.jsonl() if r["type"] == "edge"]), 3,
+                         "the log is append-only — repin adds a line, history stays "
+                         "until a prune rewrite")
+        run(self.root, "edges", "--prune")
+        edges = [r for r in self.jsonl() if r["type"] == "edge"]
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["rationale"], "survives compaction")
+        self.assertIn("repinned", edges[0],
+                      "prune's rewrite must keep the latest pin, not resurrect the "
+                      "stale original")
+        self.assertIn("[fresh|claude]", run(self.root, "edges"))
+
+    def test_cache_rebuild_reproduces_semantics_after_lifecycle(self):
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/target.md")
+        run(self.root, "edge", "add", "--src", "aa/target.md",
+            "--dst", "aa/mover.md", "--rationale", "lifecycle")
+        run(self.root, "embed", "set", "aa/target.md", "--vector", "[0.5, 0.5]")
+        write(self.root, "aa/mover.md", "# mover\n\nedited\n\nsee [other](target.md)\n")
+        run(self.root, "update")
+        run(self.root, "edge", "repin", "--src", "aa/target.md", "--dst", "aa/mover.md")
+        run(self.root, "mv", "aa/target.md", "bb/target.md", "--apply")
+        run(self.root, "edges", "--prune")
+        run(self.root, "notes", "--prune")
+
+        def snapshot():
+            notes = json.loads(run(self.root, "notes", "--json"))
+            for n in notes["notes"]:
+                n.pop("id", None)  # cache rowid, not SSOT data — renumbers on rebuild
+            return (notes, json.loads(run(self.root, "edges", "--json")),
+                    run(self.root, "embed", "status"))
+
+        before = snapshot()
+        (self.root / ".wikimap" / "index.db").unlink()
+        run(self.root, "update")
+        self.assertEqual(before, snapshot(),
+                         "index.db is a disposable cache — a rebuild from semantics.jsonl "
+                         "must reproduce notes/edges/embeds exactly")
+
+
 class TestJsonOutput(VaultTest):
     def setUp(self):
         super().setUp()
@@ -870,6 +1017,31 @@ class TestMvAndFixLinks(VaultTest):
         out = run(self.root, "semsearch", "--vector", "[1.0, 0.0]")
         self.assertIn("archive/auth-spec.md", out,
                       "a renamed doc must keep its embedding, not orphan it at the old path")
+
+    def test_mv_rewrites_self_links_to_the_new_location(self):
+        write(self.root, "notes/selfy.md",
+              "# selfy\n\nwiki [[selfy]], md [top](selfy.md), anchored [s](selfy.md#selfy)\n")
+        run(self.root, "update")
+        run(self.root, "mv", "notes/selfy.md", "archive/renamed.md", "--apply")
+        moved = (self.root / "archive/renamed.md").read_text(encoding="utf-8")
+        self.assertIn("[[renamed]]", moved)
+        self.assertIn("[top](renamed.md)", moved,
+                      "a self-link must travel with the file, not point back at the "
+                      "old location")
+        self.assertIn("[s](renamed.md#selfy)", moved)
+        out = run(self.root, "fix-links")
+        self.assertNotIn("selfy", out)
+        self.assertNotIn("renamed", out)
+
+    def test_mv_rewrites_anchored_links_and_keeps_the_anchor(self):
+        write(self.root, "notes/anchored.md",
+              "# anchored\n\nonly [s](../specs/auth-spec.md#scope) here\n")
+        run(self.root, "update")
+        self.assertIn("notes/anchored.md", run(self.root, "links", "specs/auth-spec.md"),
+                      "an anchored md link is still a link — it must be indexed")
+        run(self.root, "mv", "specs/auth-spec.md", "archive/auth-spec.md", "--apply")
+        text = (self.root / "notes/anchored.md").read_text(encoding="utf-8")
+        self.assertIn("[s](../archive/auth-spec.md#scope)", text)
 
     def test_fix_links_suggests_close_match(self):
         write(self.root, "notes/typo.md", "# typo\n\nsee [[auth-spce]] for details")

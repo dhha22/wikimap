@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -1084,6 +1084,12 @@ def write_semantics(root: Path, recs):
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs), encoding="utf-8"
     )
     tmp.replace(p)
+
+
+def rewritten_sha(text):
+    # write_text translates \n to the platform separator (CRLF on Windows) —
+    # pin the bytes that land on disk, not the in-memory string
+    return hashlib.sha256(text.replace("\n", os.linesep).encode("utf-8")).hexdigest()
 
 
 def repin_rewritten(sem, resha):
@@ -2623,8 +2629,7 @@ def cmd_link_add(root, db, args):
     new_text = "\n".join(lines) + "\n"
     p.write_text(new_text, encoding="utf-8")
     sem = load_semantics(root)
-    if repin_rewritten(sem, {doc: (old_sha,
-                                   hashlib.sha256(new_text.encode("utf-8")).hexdigest())}):
+    if repin_rewritten(sem, {doc: (old_sha, rewritten_sha(new_text))}):
         write_semantics(root, sem)
         sync_semantics(root, db)
     cmd_update(root, db, argparse.Namespace(ignore=[], map_path=None, no_map=False))
@@ -2720,12 +2725,9 @@ def cmd_mv(root, db, args):
         if own_n[0]:
             moved_text = rewritten
 
-    resha = {src: (sha256_of(root / src),
-                   hashlib.sha256(t.encode("utf-8")).hexdigest())
-             for src, t, _ in edits}
+    resha = {src: (sha256_of(root / src), rewritten_sha(t)) for src, t, _ in edits}
     if moved_text is not None:
-        resha[new] = (sha256_of(old_abs),
-                      hashlib.sha256(moved_text.encode("utf-8")).hexdigest())
+        resha[new] = (sha256_of(old_abs), rewritten_sha(moved_text))
 
     sem = load_semantics(root)
     sem_changed = 0

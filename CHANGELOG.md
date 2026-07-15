@@ -2,6 +2,12 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.0.3 — 2026-07-15
+
+### Fixed
+
+- **1.0.2's repin was a no-op on Windows.** The new pin was computed from the in-memory string, but `write_text` translates `\n` to CRLF on Windows, so the pin never matched the bytes on disk and the records stayed stale (1.0.1 behavior — no corruption, the fix just didn't take). The pin is now the sha of the bytes that actually land on disk. macOS/Linux were unaffected.
+
 ## 1.0.2 — 2026-07-15
 
 ### Fixed

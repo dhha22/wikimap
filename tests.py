@@ -526,6 +526,13 @@ class TestJsonOutput(VaultTest):
         for key in ("line", "heading", "score", "matched"):
             self.assertIn(key, top)
 
+    def test_repeated_query_token_counts_once(self):
+        single = json.loads(run(self.root, "search", "로그인 정책", "--json"))
+        doubled = json.loads(run(self.root, "search", "로그인 로그인 정책", "--json"))
+        self.assertEqual(doubled["terms"], single["terms"])
+        self.assertFalse(doubled["partial"])
+        self.assertEqual(doubled["results"][0]["path"], single["results"][0]["path"])
+
     def test_links_json(self):
         data = json.loads(run(self.root, "links", "REQ-01", "--json"))
         self.assertEqual(len(data["docs"]), 2)

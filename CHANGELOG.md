@@ -2,6 +2,12 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.0.1 — 2026-07-15
+
+### Fixed
+
+- **A word repeated in a query no longer counts twice.** Repeating a token ("register … register button") inflated its document frequency by the repeat count (so its idf sank), double-added its section score, and made every-term AND matching unsatisfiable — the query always fell back to partial mode, and `--json` `terms` listed the token twice with the inflated `df`. Query tokens are now deduplicated (order preserved) and `df` is a true document count. Measured blast radius: 4 of 290 benchmark rankings moved, all of them queries that repeat a word (v5 fan-out recall@5 0.873 → 0.887, recall@1 0.493 → 0.479; v7: zero changes).
+
 ## 1.0.0 — 2026-07-13
 
 The interface is now stable. Nothing about how wikimap works changed in this release; what changed is the commitment: **the CLI, the `--json` shapes, and the `semantics.jsonl` format won't break within 1.x.** Two data-loss bugs found while writing that guarantee down are fixed below.

@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -1258,18 +1258,13 @@ def query_idf(db, terms, hays=None):
         hays = doc_haystacks(db)
     df = {t: 0 for t in terms}
     variants = {t: minimal_variants(term_variants(t)) for t in terms}
-    # a token repeated in the query has always been df-counted once per
-    # occurrence; keep that so rankings stay byte-identical
-    counts = {}
-    for t in terms:
-        counts[t] = counts.get(t, 0) + 1
     doc_hits = {}
     for path, hay in hays.items():
-        hits = {t for t in counts if any(v in hay for v in variants[t])}
+        hits = {t for t in df if any(v in hay for v in variants[t])}
         if hits:
             doc_hits[path] = hits
             for t in hits:
-                df[t] += counts[t]
+                df[t] += 1
     ndocs = max(len(hays), 1)
     idf = {t: math.log(ndocs / df[t]) if df[t] else math.log(ndocs) for t in terms}
     return idf, sum(idf.values()), df, doc_hits
@@ -2024,6 +2019,9 @@ def cmd_search(root, db, args):
         # as a rare literal it scores a deceptively high idf and can dominate the
         # coverage gate. Drop it — field-qualified terms are kept regardless.
         terms = [(f, t) for f, t in terms if f is not None or len(t) >= 2]
+        # a repeated token would double its df and section score and make
+        # every-term AND unsatisfiable (matched terms are a set)
+        terms = list(dict.fromkeys(terms))
         plain = [t for f, t in terms if f is None]
         idf, total_idf, df, doc_hits = query_idf(db, plain, doc_hays())
         hitvs = {t: minimal_variants(term_variants(t)) for t in plain}

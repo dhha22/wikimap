@@ -6,7 +6,7 @@ All notable changes to wikimap. Versions follow [semantic versioning](https://se
 
 ### Fixed
 
-- **1.0.2's repin was a no-op on Windows.** The new pin was computed from the in-memory string, but `write_text` translates `\n` to CRLF on Windows, so the pin never matched the bytes on disk and the records stayed stale (1.0.1 behavior — no corruption, the fix just didn't take). The pin is now the sha of the bytes that actually land on disk. macOS/Linux were unaffected.
+- **1.0.2's repin was a no-op on Windows.** The index pins text docs by the sha of their decoded text, but the repin compared against the sha of the raw bytes on disk — identical on macOS/Linux, different on Windows (CRLF), so the pre-edit match never fired and the records stayed stale (1.0.1 behavior — no corruption, the fix just didn't take). Both sides of the repin now hash in the same text domain.
 
 ## 1.0.2 — 2026-07-15
 

@@ -1086,10 +1086,10 @@ def write_semantics(root: Path, recs):
     tmp.replace(p)
 
 
-def rewritten_sha(text):
-    # write_text translates \n to the platform separator (CRLF on Windows) —
-    # pin the bytes that land on disk, not the in-memory string
-    return hashlib.sha256(text.replace("\n", os.linesep).encode("utf-8")).hexdigest()
+def text_sha(text):
+    # the index pins text docs by the sha of their decoded text (parse_file), not raw
+    # bytes — CRLF on disk and LF in memory must hash identically
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def repin_rewritten(sem, resha):
@@ -2625,11 +2625,10 @@ def cmd_link_add(root, db, args):
     if not args.apply:
         print("dry run — nothing written. Re-run with --apply to execute.")
         return
-    old_sha = sha256_of(p)
     new_text = "\n".join(lines) + "\n"
     p.write_text(new_text, encoding="utf-8")
     sem = load_semantics(root)
-    if repin_rewritten(sem, {doc: (old_sha, rewritten_sha(new_text))}):
+    if repin_rewritten(sem, {doc: (text_sha(text), text_sha(new_text))}):
         write_semantics(root, sem)
         sync_semantics(root, db)
     cmd_update(root, db, argparse.Namespace(ignore=[], map_path=None, no_map=False))
@@ -2681,6 +2680,7 @@ def cmd_mv(root, db, args):
         return sub
 
     edits = []
+    resha = {}
     for src in sorted(ref_srcs):
         p = root / src
         if not p.is_file() or p.suffix.lower() not in {".md"} | PLAIN_EXTS:
@@ -2700,6 +2700,7 @@ def cmd_mv(root, db, args):
         new_text = MDURL.sub(url_sub, WIKILINK.sub(wiki_sub_for(n), text))
         if n[0]:
             edits.append((src, new_text, n[0]))
+            resha[src] = (text_sha(text), text_sha(new_text))
 
     moved_text = None
     own_n = [0]
@@ -2724,10 +2725,7 @@ def cmd_mv(root, db, args):
         rewritten = MDURL.sub(own_sub, WIKILINK.sub(wiki_sub_for(own_n), text))
         if own_n[0]:
             moved_text = rewritten
-
-    resha = {src: (sha256_of(root / src), rewritten_sha(t)) for src, t, _ in edits}
-    if moved_text is not None:
-        resha[new] = (sha256_of(old_abs), rewritten_sha(moved_text))
+            resha[new] = (text_sha(text), text_sha(rewritten))
 
     sem = load_semantics(root)
     sem_changed = 0

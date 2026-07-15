@@ -157,10 +157,6 @@ PDF_TITLE = re.compile(rb"/Title\s*\(((?:\\.|[^\\()])*)\)")
 PDF_WORD = re.compile(r"[^\W\d_]{2,}")
 
 
-def sha256_of(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def norm_rel(p):
     # index keys are POSIX-style — Windows args/paths would miss otherwise
     return str(p).replace("\\", "/")

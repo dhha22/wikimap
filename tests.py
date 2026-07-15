@@ -7,6 +7,7 @@ so what passes here is exactly what a user gets.
 """
 import json
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -46,6 +47,15 @@ def write(root, rel, text):
     p = root / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
+    return p
+
+
+def write_crlf(root, rel, text):
+    # write_bytes bypasses write_text's platform newline translation — a CRLF file
+    # on every OS, so the Windows-only sha-domain class is reproducible locally
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
     return p
 
 
@@ -598,6 +608,33 @@ class TestSemanticsRoundtrip(VaultTest):
         self.assertIn("note", types)
         self.assertIn("edge", types)
 
+    def test_link_add_repins_a_crlf_document(self):
+        write_crlf(self.root, "aa/target.md", "# target\n\nplain content\n")
+        run(self.root, "update")
+        run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
+            "--sources", "aa/target.md")
+        run(self.root, "embed", "set", "aa/target.md", "--vector", "[1.0, 0.0]")
+        run(self.root, "link", "add", "aa/target.md", "bb/referrer.md", "--apply")
+        self.assertNotIn("stale", run(self.root, "notes"),
+                         "pins live in the decoded-text sha domain — a CRLF doc must "
+                         "repin exactly like an LF one (1.0.3's Windows-only no-op)")
+        self.assertNotIn("stale", run(self.root, "embed", "status"))
+
+    def test_mv_repins_crlf_documents_it_rewrites(self):
+        write_crlf(self.root, "aa/mover.md", "# mover\n\nsee [other](target.md)\n")
+        write_crlf(self.root, "bb/referrer.md",
+                   "# referrer\n\nlink: [mover](../aa/mover.md)\n")
+        run(self.root, "update")
+        run(self.root, "edge", "add", "--src", "bb/referrer.md",
+            "--dst", "aa/target.md", "--rationale", "pinned to crlf referrer")
+        run(self.root, "note", "add", "--question", "q2", "--insight", "i2",
+            "--sources", "aa/mover.md")
+        run(self.root, "mv", "aa/mover.md", "bb/mover.md", "--apply")
+        self.assertNotIn("stale", run(self.root, "edges"),
+                         "mv rewrote a CRLF referrer — repin must fire in the text "
+                         "sha domain, not raw disk bytes")
+        self.assertNotIn("stale", run(self.root, "notes"))
+
     def test_notes_prune_keeps_stale_edges(self):
         run(self.root, "note", "add", "--question", "q1", "--insight", "i1",
             "--sources", "aa/target.md")
@@ -658,6 +695,83 @@ class TestSemanticsRoundtrip(VaultTest):
         self.assertEqual(before, snapshot(),
                          "index.db is a disposable cache — a rebuild from semantics.jsonl "
                          "must reproduce notes/edges/embeds exactly")
+
+
+class TestRoundtripProperty(unittest.TestCase):
+    """Randomized op sequences over a clean vault: wikimap's own writes must never
+    stale a pin, prune must never delete anything, and no link may break."""
+
+    SEEDS = (7, 42)
+    OPS_PER_SEED = 10
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wikimap-prop-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def build_vault(self, root):
+        root.mkdir()
+        write(root, "a/one.md", "# one\n\nsee [two](two.md) and [[three]]\n")
+        write(root, "a/two.md", "# two\n\nbody about tokens\n")
+        write(root, "b/three.md", "# three\n\nlink: [one](../a/one.md#one)\n")
+        write(root, "b/four.md", "# four\n\nplain body\n")
+        write(root, "five.md", "# five\n\n[[four]] mention\n")
+        run(root, "update")
+        return ["a/one.md", "a/two.md", "b/three.md", "b/four.md", "five.md"]
+
+    def check_invariants(self, root, note_count, edge_pairs):
+        notes = json.loads(run(root, "notes", "--json"))["notes"]
+        self.assertEqual(len(notes), note_count)
+        self.assertTrue(all(n["fresh"] for n in notes))
+        edges = json.loads(run(root, "edges", "--json"))["edges"]
+        self.assertEqual(len(edges), len(edge_pairs))
+        self.assertTrue(all(e["fresh"] for e in edges))
+        status = run(root, "embed", "status")
+        self.assertNotIn("stale", status)
+        self.assertEqual(json.loads(run(root, "fix-links", "--json"))["broken"], [])
+
+    def drive(self, seed):
+        rng = random.Random(seed)
+        root = self.tmp / f"vault-{seed}"
+        docs = self.build_vault(root)
+        note_count = 0
+        edge_pairs = set()  # keyed by doc index, stable across mv renames
+        for i in range(self.OPS_PER_SEED):
+            op = rng.choice(["mv", "link", "note", "edge", "embed", "prune", "update"])
+            if op == "mv":
+                j = rng.randrange(len(docs))
+                new = "m{}/doc{}-{}.md".format(seed, seed, i)
+                run(root, "mv", docs[j], new, "--apply")
+                docs[j] = new
+            elif op == "link":
+                a, b = rng.sample(docs, 2)
+                run(root, "link", "add", a, b, "--apply")
+            elif op == "note":
+                note_count += 1
+                run(root, "note", "add", "--question", f"q{i}",
+                    "--insight", f"i{i}", "--sources", rng.choice(docs))
+            elif op == "edge":
+                ja, jb = rng.sample(range(len(docs)), 2)
+                if frozenset((ja, jb)) in edge_pairs:
+                    continue
+                edge_pairs.add(frozenset((ja, jb)))
+                run(root, "edge", "add", "--src", docs[ja], "--dst", docs[jb],
+                    "--rationale", f"r{i}")
+            elif op == "embed":
+                run(root, "embed", "set", rng.choice(docs), "--vector", f"[{i}.0, 1.0]")
+            elif op == "prune":
+                run(root, "notes", "--prune")
+                run(root, "edges", "--prune")
+            else:
+                run(root, "update")
+        self.check_invariants(root, note_count, edge_pairs)
+        run(root, "notes", "--prune")
+        run(root, "edges", "--prune")
+        self.check_invariants(root, note_count, edge_pairs)  # prune of a healthy vault must be a no-op
+
+    def test_random_op_sequences_never_stale_lose_or_break(self):
+        for seed in self.SEEDS:
+            with self.subTest(seed=seed):
+                self.drive(seed)
 
 
 class TestJsonOutput(VaultTest):

@@ -49,7 +49,7 @@ Two more results worth naming:
 - **Golden set** (30 queries, Korean/English/mixed, 358-doc vault): **recall@5 30/30** — and still 30/30 after every feature release since 0.5.0. Ranking changes are gated on this set in CI, so a "speedup" that quietly costs you accuracy can't ship.
 - **Blind test** (20 fresh questions, written and judged by agents that didn't know which tool was which): wikimap **14/20** vs graphify **11/20**, and it won the usefulness vote **16:3:1** — all three judges unanimous on all 20.
 
-The test suite is 126 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
+The test suite is 129 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
 
 ### Natural-language search vs graphify — v5 blind benchmark (wikimap 1.0.1)
 

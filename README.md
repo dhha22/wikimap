@@ -47,9 +47,9 @@ At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time �
 Two more results worth naming:
 
 - **Golden set** (30 queries, Korean/English/mixed, 358-doc vault): **recall@5 30/30** — and still 30/30 after every feature release since 0.5.0. Ranking changes are gated on this set in CI, so a "speedup" that quietly costs you accuracy can't ship.
-- **Blind test** (20 fresh questions, written and judged by agents that didn't know which tool was which): wikimap **14/20** vs graphify **11/20**, and it won the usefulness vote **16:3:1** — all three judges unanimous on all 20.
+- **Blind test** (20 fresh fact-finding questions, authored by an agent that could only *read* the corpus — no search tools, never told which tools were competing, every question auto-verified below 0.60 similarity to all 393 earlier benchmark queries): wikimap **recall@5 0.750, MRR 0.592** vs graphify **0.550, 0.362** — and on 11 of wikimap's 17 hits the snippet already contained the answer line.
 
-The test suite is 129 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
+The test suite is 136 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
 
 ### Natural-language search vs graphify — v5 blind benchmark (wikimap 1.0.1)
 
@@ -103,6 +103,19 @@ Fan-out made search better but slower — three phrasings meant three full scans
 That last column is the point, and it's verified rather than claimed: all 148 rankings are identical to 0.14.0, down to the decimal. **A speedup that quietly reshuffled your results wouldn't be a win — it'd be a bug.**
 
 Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
+
+### Snippets that show the answer line (1.1.0)
+
+Finding the right document is only half the job. On a fact-finding benchmark (74 questions asking for a value, a name, a rule, or a verdict *inside* a doc), wikimap ranked the right document in the top 10 for 69% of fan-out queries — but the snippet showed the actual answer line for only 19%. Classifying the misses found the reason: in 31 of 37 cases the answer line sat in a *different section* of a correctly-ranked document, and the old snippet only ever looked inside the top-scoring section.
+
+1.1.0 fixes the display layer and only the display layer: matched lines now come from the **whole document**, ranked by matched idf mass (the same principle that ranks sections), capped at 5.
+
+| evidence@10 — snippet contains the answer line | 1.0.3 | 1.1.0 |
+|---|---|---|
+| single query | 0.135 | **0.243** |
+| 3-phrasing fan-out | 0.189 | **0.419** |
+
+Document rankings are byte-identical (0 changes across 290 benchmark rankings) and latency is unchanged — verified, not assumed, same as every release. On the blind 20-question set above, 11 of wikimap's 17 hits arrived with the answer line already in the snippet, so the agent never had to open the file.
 
 ## Install
 
@@ -177,6 +190,7 @@ Everything else, grouped by what it's for:
 | **Semantic search** | `embed set` / `semsearch` | For questions that share *no words* with the answer. Your agent supplies the vectors (any model); wikimap just stores and ranks them |
 | **Housekeeping** | `mv <old> <new>` | Rename a doc and rewrite every link pointing at it |
 | | `fix-links` | Suggest targets for broken links (never auto-applies) |
+| | `doctor` | Read-only integrity check: index freshness, semantics validity, broken links, stale pins — one verdict |
 | | `install` | Register as an agent skill, or `--hook` to auto-`update` on every commit |
 | | `migrate` | Move a graphify vault over in one command (see below). Dry run unless `--apply` |
 

@@ -2,6 +2,20 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.1.0 — 2026-07-15
+
+### Changed
+
+- **Search snippets now show the answer line, not just the echo.** Matched lines used to be the first 3 lines *of the top-scoring section* that contained a query term — but on a fact-finding benchmark, 25 of 28 evidence misses had the answer line sitting in a *different* section of a document that was already ranked correctly. Candidate lines now come from the whole document, ranked by matched idf mass (the same principle that ranks sections), displayed-section first on ties, capped at 5. Fact-benchmark evidence@10 rose from 0.135 → 0.243 (single query) and 0.189 → 0.419 (fan-out) with document rankings byte-identical (0 changes across 290 benchmark rankings) and no measurable latency cost. `matched` in `--json` keeps its shape (a list of strings); `-C` context now follows the picked lines.
+
+### Added
+
+- **`wikimap doctor`** — one read-only command for vault integrity: is the index behind the disk, does `semantics.jsonl` parse (malformed lines counted, unknown record types reported but kept), how many links are broken, and which pins went stale. Ends with a verdict and the command that fixes each finding. `--json` for agents.
+
+### Decided against
+
+- Pre-aggregating term document-frequencies at index time (a 0.15.0 leftover): profiling shows the df scan is 14 ms of a 137 ms query, the scan also produces the per-doc term prefilter that search needs anyway, and a token-level df table cannot reproduce the substring-variant matching semantics exactly. Not worth the ranking-drift risk.
+
 ## 1.0.3 — 2026-07-15
 
 ### Fixed

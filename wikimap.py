@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -81,15 +81,15 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied) |
 | `doctor [--json]` | read-only integrity check in one shot: index freshness (behind disk?), `semantics.jsonl` validity, broken links, stale pins — ends with the command that fixes each finding. Run it when a vault behaves oddly |
 
-`search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch`/`doctor` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the result set is empty, fell back to a partial match, or has a low top score — the signal to try the semantic path (see rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus. A `df: 0` term is dead vocabulary (nothing in the vault contains it): when reformulating, replace exactly those terms and keep the ones that hit.
+`search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch`/`doctor` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the query contains dead vocabulary (a `df: 0` term nothing in the vault contains), the result set is empty or a short query fell back to a partial match, or the top score is low — the signal to fan out with rewrites (rule 1) or try the semantic path (rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus: when reformulating, replace exactly the `df: 0` terms and keep the ones that hit. `search --compact` returns one best line per result — the diet mode for multi-query loops.
 
 Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable — the source of truth); `.wikimap/index.db` is a disposable cache rebuilt from files + that jsonl.
 
 ## Rules for the agent
 
 1. **On a vault question**: read `MAP.md` at the vault root first, then `search` for relevant sections, then Read only those file sections. Never sweep whole files. For fact/value questions ("what is the limit/period/owner?"), retry with `-C 3` or `--full` before falling back to Read.
-   **Ask in full sentences, fanned out**: a whole conversational question ("탭 토글하면 N뱃지 다시 뜨던 버그 어떻게 막았어?") searches better than hand-picked keywords — long queries are matched by information content (rare terms carry the weight; function words are ignored) and rolled up per document. For a natural-language question, pass the raw question **plus 1–2 rewrites in the vault's own vocabulary** in one call — `search "<raw question>" "<rewrite 1>" "<rewrite 2>" --json` — and the rankings are rank-fused (RRF). Never *replace* the raw question with a rewrite: the raw phrasing is a free vote and your rewrite can miss the corpus vocabulary; fusion keeps both. Rewrites that help: the document-title phrasing of the concept, the other language (Korean↔English), the technical term behind a colloquial description. Reserve `field:` filters for when you truly want to constrain.
-   **Re-query before giving up**: on 0 results, a `partial` marker, or `weak: true`, look at `terms` in the JSON — replace exactly the `df: 0` (dead) tokens with synonyms/the concept behind them/the other language, keep the tokens that hit, and search once more. The index is deterministic; the reformulation is your job. If reformulation still comes up weak and an embedding index exists (`embed status`), fall to the semantic path (rule 9) — or pass your query embedding straight into `search --hybrid` to get both halves in one call.
+   **Ask in full sentences**: a whole conversational question ("탭 토글하면 N뱃지 다시 뜨던 버그 어떻게 막았어?") searches better than hand-picked keywords — long queries are matched by information content (rare terms carry the weight; function words are ignored) and rolled up per document. Search the raw question **alone** first. Reserve `field:` filters for when you truly want to constrain.
+   **Fan out only on `weak: true`**: when the response says `weak: true`, the query carries vocabulary the vault doesn't (`terms` shows which tokens have `df: 0`). Then — and only then — re-issue as one fused call with 1–2 rewrites: `search "<raw question>" "<rewrite 1>" "<rewrite 2>" --json` (rank-fused via RRF). Never *replace* the raw question with a rewrite: the raw phrasing is a free vote and your rewrite can miss the corpus vocabulary; fusion keeps both. Rewrites that help: the document-title phrasing of the concept, the other language (Korean↔English), the technical term behind a colloquial description — swap exactly the `df: 0` tokens, keep the ones that hit. Do **not** fan out when `weak` is false: measured on 135 blind queries, unconditional fan-out diluted easy queries' top-5 precision (recall@5 0.830 → 0.741) while the weak-gated protocol kept both sides (0.889). If a fan-out still comes up weak and an embedding index exists (`embed status`), fall to the semantic path (rule 9) — or pass your query embedding straight into `search --hybrid` to get both halves in one call.
 2. **After answering**: if the answer synthesized multiple documents into a non-obvious conclusion, save it with `note add` (sources = the actual evidence files, vault-relative paths).
 3. **After creating/editing/deleting vault files**: run `update` before the session ends (sub-second, zero tokens).
 4. **`[NOTE fresh]` in search results**: sha-verified cache — trust and reuse it. Stale notes are hidden automatically.
@@ -2015,7 +2015,10 @@ def cmd_search(root, db, args):
                 continue
             if require_all and len(mterms) < len(plain):
                 continue
-            matched_idf = sum(idf.get(t, 0) for t in mterms)
+            # sum in query order, not set order: float addition isn't associative,
+            # and a hash-seed-dependent iteration produced last-ulp differences that
+            # flipped near-tie rankings between processes (1 seed in 24, measured)
+            matched_idf = sum(idf.get(t, 0) for t in plain if t in mterms)
             top_idf = max((idf.get(t, 0) for t in plain), default=0)
             if not require_all and plain:
                 if long_query:
@@ -2087,11 +2090,15 @@ def cmd_search(root, db, args):
             results = collect(all_sections(), False, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs)
             partial = True
         results.sort(key=lambda r: (-r[2], -r[1], -r[0]))
-        # a weak result set (empty, partial-fallback, or a low top score) is the signal
-        # for an agent to reformulate the dead terms (see `terms` df feedback) or fall
-        # to the semantic path. Keyword search stays the fast $0 default.
+        # weak is the fan-out trigger, so it must not saturate: long queries always
+        # run in partial/OR mode, and treating that as weakness fired on 135/135
+        # natural-language queries (v14). A dead (df=0) term is the actual
+        # vocabulary-gap signal — gating fan-out on it kept easy queries' top-5
+        # precision while recovering the gap queries (0.830 vs 0.741 always-on).
         top_score = results[0][2] if results else 0
-        weak = (not results) or partial or top_score < WEAK_SCORE
+        dead_term = any(df.get(t, 0) == 0 for t in plain)
+        weak = (not results) or dead_term or (partial and not long_query) \
+            or top_score < WEAK_SCORE
         return {"query": query, "results": results, "partial": partial, "weak": weak,
                 "plain": plain, "pvariants": pvariants, "df": df}
 
@@ -2251,10 +2258,36 @@ def cmd_search(root, db, args):
                 break
         return out
 
+    # top results earn more display budget: the answer line often sits next to a
+    # matched line rather than on it (v14: 23/51 evidence misses were within ±2
+    # lines of an already-shown line), so the first three results carry ±2 lines
+    # of context around each pick, merged into contiguous blocks
+    def snippet_blocks(path, section_content, top_slot):
+        picked = pick_lines(path, section_content, 8 if top_slot else 5)
+        dlines = doc_lines.get(path)
+        if not top_slot or not dlines:
+            return [s for _, s in picked]
+        idxs = set()
+        for order, _ in picked:
+            idxs.update(range(max(0, order - 2), min(len(dlines), order + 3)))
+        blocks, cur, prev = [], [], None
+        for j in sorted(idxs):
+            if prev is not None and j > prev + 1:
+                blocks.append("\n".join(cur).strip("\n"))
+                cur = []
+            cur.append(dlines[j].rstrip())
+            prev = j
+        if cur:
+            blocks.append("\n".join(cur).strip("\n"))
+        return [b for b in blocks if b]
+
     if args.json:
         out = []
-        for nmatched, midf, score, path, line, heading, content in shown:
-            hits = [s for _, s in pick_lines(path, content)]
+        for pos, (nmatched, midf, score, path, line, heading, content) in enumerate(shown):
+            if args.compact:
+                hits = [s for _, s in pick_lines(path, content, 1)]
+            else:
+                hits = snippet_blocks(path, content, pos < 3)
             rec = {"path": path, "line": line, "heading": heading,
                    "score": round(score, 4 if fused else 2), "matched": hits}
             if fused:
@@ -2284,7 +2317,7 @@ def cmd_search(root, db, args):
         if dead:
             print(f"~ no corpus hits for: {', '.join(dead)} — swap these for document vocabulary")
         return
-    for nmatched, midf, score, path, line, heading, content in shown:
+    for pos, (nmatched, midf, score, path, line, heading, content) in enumerate(shown):
         if fused:
             tag = f"rrf {score:.4f}, {nsources[path]}/{nvotes} queries"
         elif partial:
@@ -2298,6 +2331,10 @@ def cmd_search(root, db, args):
             for ln in content.splitlines():
                 print(f"  {ln.rstrip()}")
             continue
+        if args.compact:
+            for _, s in pick_lines(path, content, 1):
+                print(f"  {s[:160]}")
+            continue
         picked = pick_lines(path, content)
         if args.context:
             dlines = doc_lines.get(path) or content.splitlines()
@@ -2310,6 +2347,12 @@ def cmd_search(root, db, args):
                     print("  ⋯")
                 print(f"  {dlines[j].rstrip()[:200]}")
                 prev = j
+        elif pos < 3:
+            for bi, blk in enumerate(snippet_blocks(path, content, True)):
+                if bi:
+                    print("  ⋯")
+                for ln in blk.splitlines():
+                    print(f"  {ln[:200]}")
         else:
             for _, s in picked:
                 print(f"  {s[:160]}")
@@ -3151,6 +3194,8 @@ def main():
     sp.add_argument("-C", type=int, default=0, dest="context",
                     help="show N context lines around each matched line")
     sp.add_argument("--full", action="store_true", help="print the whole matched section")
+    sp.add_argument("--compact", action="store_true",
+                    help="best matched line only per result (diet mode for multi-query loops)")
     sp.add_argument("--json", action="store_true", help="structured output for agents/scripts")
     sp.add_argument("--hybrid", metavar="VEC", nargs="?", const="-",
                     help="blend agent-supplied query embedding into the ranking "

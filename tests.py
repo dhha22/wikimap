@@ -189,6 +189,63 @@ class TestEvidenceLines(VaultTest):
         self.assertLessEqual(len(r["matched"]), 5)
 
 
+class TestWeakSignal(VaultTest):
+    """weak is the fan-out trigger — it must fire on dead vocabulary, not on every
+    natural-language query (v14: partial-based weak fired on 135/135)."""
+
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def test_long_query_with_live_vocabulary_is_not_weak(self):
+        data = json.loads(run(self.root, "search",
+                              "로그인 정책 세션 만료 담당 인증 스펙", "--json"))
+        self.assertTrue(data["results"])
+        self.assertFalse(data["weak"],
+                         "a long query whose every token lives in the corpus ran in "
+                         "partial/OR mode by design — that alone is not weakness")
+
+    def test_dead_token_makes_query_weak(self):
+        data = json.loads(run(self.root, "search",
+                              "로그인 정책 세션 만료 담당 인증 zzqqx", "--json"))
+        self.assertTrue(data["results"])
+        self.assertTrue(data["weak"])
+        self.assertIn(0, [t["df"] for t in data["terms"]])
+
+    def test_short_query_and_failure_stays_weak(self):
+        data = json.loads(run(self.root, "search", "인증 위젯", "--json"))
+        self.assertTrue(data["partial"])
+        self.assertTrue(data["weak"])
+
+
+class TestSnippetContext(VaultTest):
+    """top-3 results carry ±2 lines of context around each pick — the answer line
+    often sits next to a matched line, not on it (v14: 23/51 evidence misses)."""
+
+    def setUp(self):
+        super().setUp()
+        write(self.root, "kb/ctx.md", "\n".join([
+            "# ctx", "",
+            "## payment",
+            "the flurb fee decision follows",
+            "approved at 42 dollars",
+            "unrelated closing note",
+        ]))
+        run(self.root, "update")
+
+    def test_top_result_carries_adjacent_lines(self):
+        data = json.loads(run(self.root, "search", "flurb fee", "--json"))
+        r = data["results"][0]
+        self.assertEqual(r["path"], "kb/ctx.md")
+        self.assertTrue(any("42 dollars" in m for m in r["matched"]))
+
+    def test_compact_returns_single_plain_line(self):
+        data = json.loads(run(self.root, "search", "flurb fee", "--json", "--compact"))
+        r = data["results"][0]
+        self.assertEqual(len(r["matched"]), 1)
+        self.assertNotIn("\n", r["matched"][0])
+
+
 class TestLinksAndTrustTags(VaultTest):
     def setUp(self):
         super().setUp()

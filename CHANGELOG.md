@@ -2,6 +2,27 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.2.0 — 2026-07-21
+
+### Changed
+
+- **`weak` no longer saturates — it now means what agents need it to mean: fan out.** The old formula treated partial/OR mode as weakness, but every natural-language query runs in that mode by design, so `weak: true` fired on 135/135 blind natural-language queries and carried no information. The new signal fires on *dead vocabulary* (a query token with `df: 0` — the definition of a vocabulary gap), on an empty result set, on a short query's AND→OR fallback, or on a genuinely low top score. Measured on the 135-question blind set: fires on 37/135, catches 9 of the 10 queries where fan-out rescues the answer, false-fires on 1 of the 22 where fan-out would hurt. The skill protocol changes with it: search the raw question alone first, fan out with rewrites **only when `weak: true`**. This conditional protocol scores recall@5 0.889 vs 0.830 (always-single) and 0.741 (always-fan-out) — the vocabulary-gap stratum rises 0.517 → 0.724 without diluting easy queries. On the frozen 55-question vocabulary-gap golden set: +12 recovered, 0 regressions. Document rankings are untouched (0 changes across 290 benchmark rankings and all 135 blind-set rankings).
+- **Top results now carry ±2 lines of context around each matched line.** Of 51 evidence misses on the blind set, 23 had the answer line sitting *right next to* an already-displayed line (within 2 lines) — the display was cutting the answer off, not missing the document. The first three results now pick up to 8 lines (5 before) and expand each into a contiguous block with 2 lines of context either side, merged on overlap; results beyond the top three keep the compact 5-line form. Blind-set evidence@10 rose 0.474 → 0.659 (evidence@1: 0.415 → 0.607); the cost is response size (median 14 KB → 22 KB at `-n 40`), which `--compact` exists to claw back. `matched` in `--json` keeps its shape (a list of strings; blocks are newline-joined).
+
+### Added
+
+- **`search --compact`** — one best line per result, no context blocks: the diet mode for agent loops that only need to locate documents, not read evidence from the response.
+
+### Fixed
+
+- **Rankings no longer depend on the process's hash seed.** A document's matched idf mass (the tie-break key right after score) was summed by iterating a Python set, and float addition is not associative — different `PYTHONHASHSEED` draws produced last-ulp differences that flipped near-tie rankings between processes (measured: 1 seed in 24 on a fan-out benchmark query, against the tool's core determinism promise). The sum now runs in query-token order; all 24 seeds produce identical rankings on the affected queries.
+
+### Decided against
+
+- **Always-on fan-out** (the 1.0-era skill guidance): measured cost is recall@5 0.830 → 0.741 on 135 blind queries — rewrites dilute the top-5 precision of queries that didn't need help. Fan-out is now gated on `weak`.
+- **Typo-tolerance work (fuzzy fallback on dead tokens)**: the blind set's 12 deterministic typo pairs (space collapse, adjacent-jamo substitution, cross-IME) cost wikimap a net **zero** — CJK substring matching is structurally immune to the common cases, and the conditional fan-out protocol lifts the typo stratum to 0.917 anyway. Deprioritized until a measured gap appears.
+- **Rule/condition-type reinforcement**: v13's alarming 0.4 recall@5 on rule-type queries remeasured at 0.933 on n=30 — a small-sample artifact, not a weakness.
+
 ## 1.1.0 — 2026-07-15
 
 ### Changed

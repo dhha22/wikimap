@@ -117,6 +117,60 @@ Finding the right document is only half the job. On a fact-finding benchmark (74
 
 Document rankings are byte-identical (0 changes across 290 benchmark rankings) and latency is unchanged — verified, not assumed, same as every release. On the blind 20-question set above, 11 of wikimap's 17 hits arrived with the answer line already in the snippet, so the agent never had to open the file.
 
+### 135 blind questions vs a freshly rebuilt graph — a pre-registered verdict (1.1.0)
+
+Every earlier comparison had a soft spot someone could poke: 20 blind questions is a small sample, and graphify was running on a graph built from an older, smaller corpus. So this round removed both excuses, and the pass/fail bar was **written down before any query ran**: wikimap only gets to claim a decisive win if recall@5 beats graphify by McNemar exact test p < 0.05 *and* an absolute margin of at least +0.15. Miss either, and the claim is off the table regardless of who's ahead.
+
+The setup: a 622-file snapshot of a live Korean/English vault, frozen before authoring. **23 independent agents** each read a disjoint slice of the corpus — no search tools, never told what was being tested — and wrote stratified questions (rules & conditions, deliberate vocabulary gaps, facts, decision narratives, multi-hop, plus mechanical typo variants paired with their originals). Every question passed an automated similarity gate against all 431 earlier benchmark queries (< 0.60) and an independent per-question verification agent before freezing: 135 questions. graphify got a **fresh graph built from the exact same snapshot** by its own pipeline (2,426 nodes, all 418 markdown docs covered — ~57 minutes and ~35M tokens of extraction). wikimap indexed the same snapshot in **1.42 s at $0**.
+
+```mermaid
+xychart-beta
+    title "135 blind questions — recall / MRR (higher is better)"
+    x-axis ["recall@1", "recall@3", "recall@5", "recall@10", "MRR"]
+    y-axis "score" 0 --> 1
+    bar [0.585, 0.756, 0.830, 0.837, 0.684]
+    bar [0.526, 0.667, 0.741, 0.844, 0.631]
+    line [0.333, 0.511, 0.570, 0.667, 0.443]
+```
+
+<sub>bars = wikimap 1.1.0, **single query** · **3-phrasing fan-out** · line = graphify (fresh graph, BFS)</sub>
+
+| Metric | wikimap — single | wikimap — fan-out | graphify (fresh) |
+|---|---|---|---|
+| recall@5 | **0.830** | 0.741 | 0.570 |
+| MRR | **0.684** | 0.631 | 0.443 |
+| complete misses (rank 0) | 19 | **1** | 30 |
+| evidence@10 (snippet shows the answer line) | 0.474 | **0.615** | 0.007* |
+| index / graph build | **1.42 s, $0** | same | ~57 min, ~35M tokens |
+
+<sub>*graphify returns entity labels, not source lines, so its evidence number is a different kind of thing — listed for completeness, not fairness.</sub>
+
+**Verdict: criterion met.** recall@5 differs by +0.259 (bootstrap 95% CI [+0.163, +0.356]); of the 51 questions where exactly one tool succeeded, wikimap won 43 and graphify won 8 (McNemar p < 0.00001). The fan-out mode clears the pre-registered bar independently (+0.170, p = 0.0022).
+
+Three honest findings came out of the strata, and they matter more than the headline:
+
+- **The one place wikimap doesn't win is deliberate vocabulary gaps** — questions phrased to avoid the document's own words. There it ties graphify (0.517 vs 0.483). This is the structural limit of keyword matching, and it's now a frozen 55-question golden set that every future feature must move.
+- **Fan-out rescues exactly those questions** (vocab-gap recall 0.517 → 0.690, complete misses 19 → 1) but dilutes easy queries' top ranks. The lesson for 1.2.0: fan out *conditionally*, when the first pass looks weak — not always.
+- **Typo robustness came free**: across 12 typo/original pairs (collapsed spaces, adjacent-jamo slips, wrong-IME English), wikimap lost nothing — substring matching over CJK text simply doesn't care about missing spaces.
+
+### Conditional fan-out — the benchmark's homework, done (1.2.0)
+
+The blind benchmark left a precise to-do list, and 1.2.0 is that list executed. Both changes come from classifying the misses, and neither touches document ranking (0 changes across all 290 + 135 benchmark rankings — verified per release, as always).
+
+**Fan out only when the query actually needs it.** The old `weak` flag was supposed to tell agents "reformulate this", but it fired on 135 of 135 natural-language queries — partial/OR mode was treated as weakness, and every conversational question runs in that mode by design. The redesigned signal fires on **dead vocabulary**: a query token with `df: 0`, which is the literal definition of a vocabulary gap. On the blind set it fires on 37/135 queries, catches 9 of the 10 that fan-out rescues, and false-fires on 1 of the 22 that fan-out would hurt. The skill protocol is now: search the raw question alone; fan out with rewrites only on `weak: true`.
+
+| recall@5, 135 blind questions | always single | always fan-out | conditional (1.2.0 protocol) |
+|---|---|---|---|
+| overall | 0.830 | 0.741 | **0.889** |
+| vocabulary-gap stratum | 0.517 | 0.690 | **0.724** |
+| typo stratum | 0.833 | — | **0.917** |
+
+On the frozen 55-question vocabulary-gap golden set: **12 recovered, 0 regressions**. Conditional beats *both* fixed strategies — the gate keeps easy queries' precision and spends rewrites exactly where words are missing.
+
+**Snippets grew context where it pays.** Of 51 remaining evidence misses, 23 had the answer line sitting within 2 lines of a line the snippet already showed — the display was cutting the answer off, not missing the document. The top three results now carry ±2 lines of context around each matched line (merged into contiguous blocks, up to 8 picks); later results keep the compact form, and `search --compact` returns one line per result when you want the diet. Blind-set evidence@10: **0.474 → 0.659** (evidence@1 0.415 → 0.607).
+
+The same release also fixed a real determinism bug the gate runs surfaced: matched-idf tie-breaks were summed in Python-set order, so one hash seed in 24 could flip a near-tie ranking between processes. Sums now run in query order — 24 seeds, identical rankings.
+
 ## Install
 
 ```bash
@@ -174,7 +228,7 @@ The two you'll actually type:
 | Command | What it does |
 |---|---|
 | `update` | Re-index what changed and refresh `MAP.md`. Sub-second, $0. Run it after edits (or let the git hook do it) |
-| `search "query" ["rewrite" ...]` | Find the section that answers a question. Returns file, line number, and the matching lines. Pass extra phrasings to fuse them into one ranking |
+| `search "query" ["rewrite" ...]` | Find the section that answers a question. Returns file, line number, and the matching lines (top results with ±2 lines of context; `--compact` for one line per result). Pass extra phrasings to fuse them into one ranking — the JSON's `weak: true` tells you when that's worth doing |
 
 Everything else, grouped by what it's for:
 

@@ -25,151 +25,30 @@ The trick that makes this safe: **everything saved is stamped with the source fi
 
 So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
-## Measured vs graphify (262-doc Korean/English vault, M-series Mac)
+## Why wikimap
 
-<sub>The wikimap column is **measured on 1.0.0** (270-doc link-stripped Korean/English corpus, M-series Mac, median of 3–5 runs per row). The graphify column is from actually running graphify on the original 262-doc vault — the doc counts differ slightly but the scale is comparable, and the point is the order-of-magnitude gap, not the absolute numbers.</sub>
+- **Instant, free indexing.** Full build and incremental updates finish in well under a second, with **zero LLM tokens** — graphify needs minutes and millions of tokens for the same vault.
+- **More accurate search, not less.** On 135 blind questions (written by agents that only read the corpus, verified before any query ran), wikimap beats a freshly-built graphify graph on recall and puts the answer line right in the snippet.
+- **Deterministic and self-cleaning.** Same input → byte-identical index; deleted files disappear on their own. No ghost nodes, no reshuffled results between runs.
+- **Any language, any format.** No hardcoded stopword list, so Korean/English/mixed all work; indexes Markdown plus `.txt/.rst/.org/.adoc`, HTML, PDF, and image filenames.
 
-| Operation | wikimap 1.0.0 | graphify (comparable vault, same change set) |
+| | wikimap | graphify |
 |---|---|---|
-| Full index build | **0.28 s, $0** (indexing 0.22 s) | minutes + LLM extraction cost |
-| Update after editing 1 doc + adding 1 + deleting 1 | **0.07 s, 0 tokens** | **~95 s + 46k tokens** (measured), plus community re-labeling |
-| Update after index drifted for days | still sub-second (sha-diff, no-op 0.07 s) | re-detected 287 of 306 files as changed → near-full re-extraction |
-| Link-candidate generation (all 270 docs) | **0.32 s, 0 tokens** (7,438 pairs) | graph build 314 s + 2.41M tokens |
-| Search latency (natural-language query) | **0.15 s** single, **0.26 s** 3-phrasing fan-out (cold process, index load included) | 1 ms in-memory — *after* an 11-minute, 2.2M-token graph build |
-| Search output | section + line number + matched snippet | entity labels; you still re-read the source files |
-| Deleted file cleanup | automatic, verified | 9.7% of source files in the graph were ghosts (already deleted); 40 duplicate node labels |
-| Determinism | same input → byte-identical index | non-deterministic graphs from identical inputs ([upstream #1695](https://github.com/Graphify-Labs/graphify/issues/1695)) |
+| Full index build | **sub-second, $0** | minutes + LLM cost |
+| Update after edits | **~0.07 s, 0 tokens** | ~95 s + tens of thousands of tokens |
+| Search accuracy (recall@5, 135 blind Qs) | **0.83** | 0.57 |
+| Snippet shows the answer line | yes (section + line) | no (entity labels only) |
+| Determinism | byte-identical every run | non-deterministic graphs |
 
-<sub>The search-latency row is the one place graphify wins on raw numbers, and it deserves the asterisk: its 1 ms is an in-memory graph lookup *after* paying minutes and millions of tokens to build that graph, while wikimap's 0.15 s spawns a fresh process and loads the index every single call. Total cost of ownership is not close.</sub>
+<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). The test suite is 136 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
 
-At scale (same vault duplicated to **3,760 docs**): full build 12 s (one-time — an FTS5 trigram index kicks in at ≥500 docs), incremental update with 3 changes **0.19 s**, search 60–100 ms via FTS5 (vs ~0.3 s linear fallback). Queries containing terms under 3 characters fall back to the exact linear scan, so CJK short-word recall is never sacrificed for speed.
-
-Two more results worth naming:
-
-- **Golden set** (30 queries, Korean/English/mixed, 358-doc vault): **recall@5 30/30** — and still 30/30 after every feature release since 0.5.0. Ranking changes are gated on this set in CI, so a "speedup" that quietly costs you accuracy can't ship.
-- **Blind test** (20 fresh fact-finding questions, authored by an agent that could only *read* the corpus — no search tools, never told which tools were competing, every question auto-verified below 0.60 similarity to all 393 earlier benchmark queries): wikimap **recall@5 0.750, MRR 0.592** vs graphify **0.550, 0.362** — and on 11 of wikimap's 17 hits the snippet already contained the answer line.
-
-The test suite is 136 tests, stdlib only (`python3 tests.py`), run on macOS/Linux/Windows and Python 3.8–3.13.
-
-### Natural-language search vs graphify — v5 blind benchmark (wikimap 1.0.1)
-
-Earlier golden sets echoed document titles. The **v5** set does the opposite: 71 conversational questions aimed at the *body* of a doc (a decision, a number, an edge case), written by per-document agents that read the source and never saw a title. The answer key shares **zero documents** with the v3 and v4 sets, so a gain here is real search skill, not overfitting. Both tools run on the same 270-doc corpus; graphify reuses its v1 graph (314 s + 2.4M tokens to build), wikimap indexes in 0.23 s at $0.
-
-```mermaid
-xychart-beta
-    title "v5 natural-language search — recall / MRR (71 queries, higher is better)"
-    x-axis ["recall@1", "recall@3", "recall@5", "recall@10", "MRR"]
-    y-axis "score" 0 --> 1
-    bar [0.507, 0.746, 0.789, 0.803, 0.626]
-    bar [0.479, 0.761, 0.887, 0.944, 0.641]
-    line [0.183, 0.394, 0.563, 0.690, 0.338]
-```
-
-<sub>bars = wikimap 1.0.1, **single query** · **3-phrasing fan-out** (raw question + 2 agent rewrites, one call) · line = graphify (v1 graph, BFS) — full numbers in the table below</sub>
-
-| Metric | wikimap — single query | wikimap — fan-out | graphify |
-|---|---|---|---|
-| recall@1 | **0.507** | 0.479 | 0.183 |
-| recall@3 | 0.746 | **0.761** | 0.394 |
-| recall@5 | 0.789 | **0.887** | 0.563 |
-| recall@10 | 0.803 | **0.944** | 0.690 |
-| MRR | 0.626 | **0.641** | 0.338 |
-| top-40 misses | 14 | **0** | — |
-| Link-generation (270 docs) | **0.59 s, 0 tokens** | — | 314 s, 2.4M tokens |
-
-<sub>The two wikimap columns are **query modes, not versions** — both re-measured on 1.0.1. Its duplicate-token fix moved exactly 4 of 290 benchmark rankings, all of them queries that repeat a word; every other ranking reproduces 0.13.0–1.0.0 to three decimals.</sub>
-
-**Why wikimap wins here without an LLM:** the work happens at *query* time, not build time. Function words are dropped by how common they are in your corpus (no hardcoded stoplist, so it works in any language), matches scattered across a document's sections are added up together, and word endings are handled generically — `core:ui로` still finds `core` and `ui`. All of it deterministic, all of it $0.
-
-**Fan-out is the one thing you have to opt into.** Pass the question *plus* a rewrite or two in one call:
+**Fan-out for the hard queries.** Pass the question *plus* a rewrite or two in one call and the rankings fuse, so a document several phrasings agree on rises to the top:
 
 ```bash
 wikimap search "how long do sessions last?" "session expiry" "REQ-02 timeout"
 ```
 
-The rankings get fused, so a document that several phrasings agree on rises to the top. The original question always stays in the vote, so rewrites can only add — and that's what closed the gap: **14 hard misses → 0**. Your agent writes the rewrites (it's already in the loop; no extra API call), and three phrasings cost only ~0.1 s more than one.
-
-The tradeoff is honest: recall@1 dips slightly, because fusing several rankings dilutes the single best hit. Use fan-out when you'd rather not miss; use a single query when you want the sharpest top hit.
-
-### Fan-out, without the wait (0.15.0)
-
-Fan-out made search better but slower — three phrasings meant three full scans. 0.15.0 fixes that by **caching, not by rescoring**, so it's twice as fast and returns *exactly* the same results.
-
-| | 0.14.0 | 0.15.0 | results changed |
-|---|---|---|---|
-| Single query | 0.30 s | **0.15 s** | **none** |
-| 3-phrasing fan-out | 0.66 s | **0.26 s** | **none** |
-
-That last column is the point, and it's verified rather than claimed: all 148 rankings are identical to 0.14.0, down to the decimal. **A speedup that quietly reshuffled your results wouldn't be a win — it'd be a bug.**
-
-Reproduce on your own vault: `python3 bench.py --root <vault> --cold`, or with your own golden set: `bench.py --root <vault> --queries q.tsv` (lines of `query<TAB>expected-path-substring`).
-
-### Snippets that show the answer line (1.1.0)
-
-Finding the right document is only half the job. On a fact-finding benchmark (74 questions asking for a value, a name, a rule, or a verdict *inside* a doc), wikimap ranked the right document in the top 10 for 69% of fan-out queries — but the snippet showed the actual answer line for only 19%. Classifying the misses found the reason: in 31 of 37 cases the answer line sat in a *different section* of a correctly-ranked document, and the old snippet only ever looked inside the top-scoring section.
-
-1.1.0 fixes the display layer and only the display layer: matched lines now come from the **whole document**, ranked by matched idf mass (the same principle that ranks sections), capped at 5.
-
-| evidence@10 — snippet contains the answer line | 1.0.3 | 1.1.0 |
-|---|---|---|
-| single query | 0.135 | **0.243** |
-| 3-phrasing fan-out | 0.189 | **0.419** |
-
-Document rankings are byte-identical (0 changes across 290 benchmark rankings) and latency is unchanged — verified, not assumed, same as every release. On the blind 20-question set above, 11 of wikimap's 17 hits arrived with the answer line already in the snippet, so the agent never had to open the file.
-
-### 135 blind questions vs a freshly rebuilt graph — a pre-registered verdict (1.1.0)
-
-Every earlier comparison had a soft spot someone could poke: 20 blind questions is a small sample, and graphify was running on a graph built from an older, smaller corpus. So this round removed both excuses, and the pass/fail bar was **written down before any query ran**: wikimap only gets to claim a decisive win if recall@5 beats graphify by McNemar exact test p < 0.05 *and* an absolute margin of at least +0.15. Miss either, and the claim is off the table regardless of who's ahead.
-
-The setup: a 622-file snapshot of a live Korean/English vault, frozen before authoring. **23 independent agents** each read a disjoint slice of the corpus — no search tools, never told what was being tested — and wrote stratified questions (rules & conditions, deliberate vocabulary gaps, facts, decision narratives, multi-hop, plus mechanical typo variants paired with their originals). Every question passed an automated similarity gate against all 431 earlier benchmark queries (< 0.60) and an independent per-question verification agent before freezing: 135 questions. graphify got a **fresh graph built from the exact same snapshot** by its own pipeline (2,426 nodes, all 418 markdown docs covered — ~57 minutes and ~35M tokens of extraction). wikimap indexed the same snapshot in **1.42 s at $0**.
-
-```mermaid
-xychart-beta
-    title "135 blind questions — recall / MRR (higher is better)"
-    x-axis ["recall@1", "recall@3", "recall@5", "recall@10", "MRR"]
-    y-axis "score" 0 --> 1
-    bar [0.585, 0.756, 0.830, 0.837, 0.684]
-    bar [0.526, 0.667, 0.741, 0.844, 0.631]
-    line [0.333, 0.511, 0.570, 0.667, 0.443]
-```
-
-<sub>bars = wikimap 1.1.0, **single query** · **3-phrasing fan-out** · line = graphify (fresh graph, BFS)</sub>
-
-| Metric | wikimap — single | wikimap — fan-out | graphify (fresh) |
-|---|---|---|---|
-| recall@5 | **0.830** | 0.741 | 0.570 |
-| MRR | **0.684** | 0.631 | 0.443 |
-| complete misses (rank 0) | 19 | **1** | 30 |
-| evidence@10 (snippet shows the answer line) | 0.474 | **0.615** | 0.007* |
-| index / graph build | **1.42 s, $0** | same | ~57 min, ~35M tokens |
-
-<sub>*graphify returns entity labels, not source lines, so its evidence number is a different kind of thing — listed for completeness, not fairness.</sub>
-
-**Verdict: criterion met.** recall@5 differs by +0.259 (bootstrap 95% CI [+0.163, +0.356]); of the 51 questions where exactly one tool succeeded, wikimap won 43 and graphify won 8 (McNemar p < 0.00001). The fan-out mode clears the pre-registered bar independently (+0.170, p = 0.0022).
-
-Three honest findings came out of the strata, and they matter more than the headline:
-
-- **The one place wikimap doesn't win is deliberate vocabulary gaps** — questions phrased to avoid the document's own words. There it ties graphify (0.517 vs 0.483). This is the structural limit of keyword matching, and it's now a frozen 55-question golden set that every future feature must move.
-- **Fan-out rescues exactly those questions** (vocab-gap recall 0.517 → 0.690, complete misses 19 → 1) but dilutes easy queries' top ranks. The lesson for 1.2.0: fan out *conditionally*, when the first pass looks weak — not always.
-- **Typo robustness came free**: across 12 typo/original pairs (collapsed spaces, adjacent-jamo slips, wrong-IME English), wikimap lost nothing — substring matching over CJK text simply doesn't care about missing spaces.
-
-### Conditional fan-out — the benchmark's homework, done (1.2.0)
-
-The blind benchmark left a precise to-do list, and 1.2.0 is that list executed. Both changes come from classifying the misses, and neither touches document ranking (0 changes across all 290 + 135 benchmark rankings — verified per release, as always).
-
-**Fan out only when the query actually needs it.** The old `weak` flag was supposed to tell agents "reformulate this", but it fired on 135 of 135 natural-language queries — partial/OR mode was treated as weakness, and every conversational question runs in that mode by design. The redesigned signal fires on **dead vocabulary**: a query token with `df: 0`, which is the literal definition of a vocabulary gap. On the blind set it fires on 37/135 queries, catches 9 of the 10 that fan-out rescues, and false-fires on 1 of the 22 that fan-out would hurt. The skill protocol is now: search the raw question alone; fan out with rewrites only on `weak: true`.
-
-| recall@5, 135 blind questions | always single | always fan-out | conditional (1.2.0 protocol) |
-|---|---|---|---|
-| overall | 0.830 | 0.741 | **0.889** |
-| vocabulary-gap stratum | 0.517 | 0.690 | **0.724** |
-| typo stratum | 0.833 | — | **0.917** |
-
-On the frozen 55-question vocabulary-gap golden set: **12 recovered, 0 regressions**. Conditional beats *both* fixed strategies — the gate keeps easy queries' precision and spends rewrites exactly where words are missing.
-
-**Snippets grew context where it pays.** Of 51 remaining evidence misses, 23 had the answer line sitting within 2 lines of a line the snippet already showed — the display was cutting the answer off, not missing the document. The top three results now carry ±2 lines of context around each matched line (merged into contiguous blocks, up to 8 picks); later results keep the compact form, and `search --compact` returns one line per result when you want the diet. Blind-set evidence@10: **0.474 → 0.659** (evidence@1 0.415 → 0.607).
-
-The same release also fixed a real determinism bug the gate runs surfaced: matched-idf tie-breaks were summed in Python-set order, so one hash seed in 24 could flip a near-tie ranking between processes. Sums now run in query order — 24 seeds, identical rankings.
+Your agent writes the rewrites (no extra API call), and `weak: true` in the output tells it when a query actually needs them — so easy queries stay sharp and rewrites are spent only where words are missing.
 
 ## Install
 

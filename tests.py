@@ -8,6 +8,7 @@ so what passes here is exactly what a user gets.
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -329,6 +330,40 @@ class TestHealth(VaultTest):
         self.assertNotIn(".github/tmpl.md", [i["link"] for i in fl["broken"]])
         doc = json.loads(run(self.root, "doctor", "--json"))
         self.assertEqual(doc["links"]["unindexed"], 1)
+
+    def test_percent_encoded_link_resolves_to_the_real_file(self):
+        # editors write [x](with%20space.md) for a file named "with space.md";
+        # without decoding it was reported broken/unindexed and mv skipped it
+        write(self.root, "notes/target file.md", "# T\n\nzzmarker")
+        write(self.root, "notes/enc.md", "# E\n\n[t](target%20file.md)")
+        run(self.root, "update")
+        fl = json.loads(run(self.root, "fix-links", "--json"))
+        flagged = [i["link"] for i in fl["broken"]] + [i["link"] for i in fl["unindexed"]]
+        self.assertNotIn("notes/target file.md", flagged)
+        self.assertNotIn("target%20file.md", flagged)
+        # the decoded target must actually join the link graph, not merely go unreported
+        links = run(self.root, "links", "notes/target file.md")
+        self.assertIn("notes/enc.md", links)
+
+    def test_percent_encoded_link_is_rewritten_by_mv(self):
+        write(self.root, "notes/target file.md", "# T")
+        write(self.root, "notes/enc.md", "# E\n\n[t](target%20file.md)")
+        run(self.root, "update")
+        run(self.root, "mv", "notes/target file.md", "notes/renamed file.md", "--apply")
+        body = (self.root / "notes/enc.md").read_text(encoding="utf-8")
+        self.assertIn("renamed file.md", body)
+        self.assertNotIn("target%20file.md", body)
+
+    def test_literal_percent_in_filename_survives(self):
+        # a bare '%' is a legal filename character — decoding must not corrupt it,
+        # and a malformed escape must be left exactly as written
+        write(self.root, "notes/100%.md", "# pct")
+        write(self.root, "notes/pct.md", "# P\n\n[a](100%.md)\n[b](bad%zz.md)")
+        run(self.root, "update")
+        fl = json.loads(run(self.root, "fix-links", "--json"))
+        broken = [i["link"] for i in fl["broken"]]
+        self.assertNotIn("notes/100%.md", broken)
+        self.assertIn("notes/bad%zz.md", broken)
 
     def test_link_escaping_the_vault_stays_broken(self):
         # the target really does exist on disk, but it sits outside the vault —
@@ -1923,3 +1958,18 @@ class TestMigrateFromGraphify(VaultTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEmptyAlternationGuard(VaultTest):
+    """the two term-variant matchers compile "|".join(variants); an empty variant
+    set would yield "" — a pattern that matches EVERYTHING, the exact inverse of
+    the any() loop it replaced. Unreachable via the CLI today (1-char plain terms
+    are dropped upstream), so this pins the guard directly."""
+
+    def test_empty_variant_set_never_matches(self):
+        import wikimap
+        self.assertEqual(wikimap.minimal_variants(wikimap.term_variants("a")), [])
+        pat = "|".join(() ) or wikimap.NEVER_MATCHES
+        self.assertIsNone(re.compile(pat).search("anything at all"))
+        self.assertIsNotNone(re.compile("").search("anything at all"),
+                             "sanity: the unguarded empty pattern really does match all")

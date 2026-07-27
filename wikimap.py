@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -162,6 +162,24 @@ PDF_WORD = re.compile(r"[^\W\d_]{2,}")
 def norm_rel(p):
     # index keys are POSIX-style — Windows args/paths would miss otherwise
     return str(p).replace("\\", "/")
+
+
+def decode_link(url):
+    """Percent-decode a markdown link target so it can match the file on disk.
+
+    Editors write `[x](with%20space.md)` for a file literally named "with space.md".
+    Only applied when the URL actually carries an escape, and rolled back if
+    decoding yields nothing usable — a filename containing a bare '%' must survive
+    untouched (`100%.md` is a real name, and unquote would leave it alone anyway,
+    but `%zz` style near-misses must not corrupt the path).
+    """
+    if "%" not in url:
+        return url
+    try:
+        decoded = urllib.parse.unquote(url, errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return url
+    return decoded or url
 
 
 def find_root(cli_root):
@@ -803,7 +821,7 @@ def parse_file(root: Path, path: Path):
     stat_mtime = path.stat().st_mtime
 
     def resolve_doc_link(dst):
-        resolved = (path.parent / dst).resolve()
+        resolved = (path.parent / decode_link(dst)).resolve()
         try:
             return resolved.relative_to(root).as_posix()
         except ValueError:
@@ -1254,6 +1272,10 @@ def structure_words(paths, ratio=0.06):
     return {t for t, c in df.items() if c >= cutoff}
 
 
+# an alternation that can never match — see the guards below
+NEVER_MATCHES = r"(?!)"
+
+
 def minimal_variants(variants):
     """The subset of variants sufficient for a boolean substring hit-test: if a
     kept variant is itself a substring of another, the longer one can never match
@@ -1356,8 +1378,12 @@ def query_idf(db, terms, hays=None):
     # one compiled alternation per term beats a Python any(v in hay ...) loop:
     # the C regex engine scans each haystack once per term instead of once per
     # (term, variant) pair. Same matches — verified byte-identical df/doc_hits.
+    # NEVER_MATCHES guards the empty variant set: "|".join([]) is "", and an empty
+    # pattern matches every string — the exact inverse of any(v in hay for v in []).
+    # Unreachable today (1-char plain terms are dropped upstream), but the two
+    # matchers below must not silently invert if that filter ever changes.
     pats = {t: re.compile("|".join(re.escape(v)
-            for v in sorted(vs, key=len, reverse=True)))
+            for v in sorted(vs, key=len, reverse=True)) or NEVER_MATCHES)
             for t, vs in variants.items()}
     doc_hits = {}
     for path, hay in hays.items():
@@ -1777,7 +1803,7 @@ def link_exists_on_disk(root, src, dst):
     """
     if dst.startswith("../") or dst.startswith("/") or "://" in dst:
         return False
-    cand = urllib.parse.unquote(dst)
+    cand = decode_link(dst)
     try:
         target = (Path(root) / cand).resolve()
         target.relative_to(Path(root).resolve())
@@ -2065,7 +2091,7 @@ def cmd_search(root, db, args):
         # term (boolean only — the frequency term below still uses str.count,
         # which is NOT regex-equivalent when variants overlap).
         hit_re = {t: re.compile("|".join(re.escape(v)
-                  for v in sorted(vs, key=len, reverse=True)))
+                  for v in sorted(vs, key=len, reverse=True)) or NEVER_MATCHES)
                   for t, vs in hitvs.items()}
         # roll matches up to the DOCUMENT: plain terms scattered across several
         # sections of one doc are unioned, so a doc that mentions each query term
@@ -2876,7 +2902,7 @@ def cmd_mv(root, db, args):
         "SELECT alias FROM aliases WHERE path=?", (old,))}
 
     def resolve_from(src_rel, url):
-        resolved = ((root / src_rel).parent / url).resolve()
+        resolved = ((root / src_rel).parent / decode_link(url)).resolve()
         try:
             return resolved.relative_to(root).as_posix()
         except ValueError:

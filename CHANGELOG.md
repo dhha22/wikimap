@@ -2,6 +2,13 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.3.1 — 2026-07-27
+
+### Fixed
+
+- **Percent-encoded link targets now resolve to the file they name.** Editors write `[x](with%20space.md)` for a file literally called `with space.md`, but link resolution never decoded the escape, so the target was treated as a different (missing) file. Two consequences: the link was reported under Health instead of joining the link graph — `wikimap links "with space.md"` showed no backlinks — and, more seriously, `wikimap mv` **silently skipped rewriting those references**, leaving a genuinely broken link behind after a rename. Both resolution paths (`parse_file` at index time and `mv`'s own rewriter) now decode before resolving. A literal `%` in a filename (`100%.md`) and a malformed escape (`bad%zz.md`) are left exactly as written.
+- **Empty term-variant sets can no longer invert the search prefilter.** The two matchers introduced in 1.3.0 compile `"|".join(variants)`; for an empty variant set that is `""`, and an empty pattern matches *every* string — the exact inverse of the `any(v in text ...)` loop it replaced. No query can reach this today (single-character plain terms are dropped before the matchers are built), so nothing was miscounted in 1.3.0; the guard is there so a future change to that filter can't silently flip the prefilter. Pinned by a test.
+
 ## 1.3.0 — 2026-07-27
 
 ### Changed

@@ -23,13 +23,14 @@ import shutil
 import sqlite3
 import sys
 import time
+import urllib.parse
 import zlib
 from collections import Counter, deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -60,7 +61,7 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 
 | Command | Purpose |
 |---------|---------|
-| `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
+| `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, links to unindexed files, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
 | `search "query" ["variant" ...] [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows the best-matching lines from the *whole* document (≤5, so the answer line surfaces even when it lives outside the top-scoring section); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard). **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — a doc multiple phrasings agree on wins |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
@@ -78,7 +79,7 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | `import-graphify <graph.json>` | one-time import of INFERRED edges from an existing graphify graph (`migrate` does this for you) |
 | `install --hook` | git post-commit hook that runs `update` automatically (appends to an existing hook) |
 | `mv <old> <new> [--apply]` | move/rename a doc AND rewrite every wikilink/md/img reference to it (dry run without `--apply`); semantics.jsonl paths updated too |
-| `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied) |
+| `fix-links [--json]` | for every broken link the Health section counts: suggest close-match targets (suggestions only, never auto-applied); links whose target exists on disk but was never indexed (dot-dir, `.wikimapignore`) are listed apart as `unindexed`, not as broken |
 | `doctor [--json]` | read-only integrity check in one shot: index freshness (behind disk?), `semantics.jsonl` validity, broken links, stale pins — ends with the command that fixes each finding. Run it when a vault behaves oddly |
 
 `search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch`/`doctor` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the query contains dead vocabulary (a `df: 0` term nothing in the vault contains), the result set is empty or a short query fell back to a partial match, or the top score is low — the signal to fan out with rewrites (rule 1) or try the semantic path (rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus: when reformulating, replace exactly the `df: 0` terms and keep the ones that hit. `search --compact` returns one best line per result — the diet mode for multi-query loops.
@@ -203,6 +204,7 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS img_alts(src TEXT, dst TEXT, alt TEXT);
         CREATE INDEX IF NOT EXISTS idx_img_alts_src ON img_alts(src);
         CREATE TABLE IF NOT EXISTS embeds(path TEXT PRIMARY KEY, sha TEXT, vec TEXT);
+        CREATE TABLE IF NOT EXISTS haystacks(path TEXT PRIMARY KEY, hay TEXT);
         """
     )
     try:
@@ -1264,15 +1266,80 @@ def minimal_variants(variants):
     return out
 
 
-def doc_haystacks(db):
+def corpus_fingerprint(db):
+    """Cheap identity of the indexed corpus: count + a sha of the sha column."""
+    n, blob = db.execute(
+        "SELECT COUNT(*), COALESCE(GROUP_CONCAT(sha), '') FROM "
+        "(SELECT sha FROM files ORDER BY path)").fetchone()
+    return f"{n}:{hashlib.sha256(blob.encode()).hexdigest()[:16]}"
+
+
+def build_haystacks(db, only=None):
+    """Per-doc lowercase text the idf prefilter matches against.
+
+    `only` restricts the work to a set of paths so an incremental update doesn't
+    re-lower a corpus that didn't change.
+    """
+    if only is not None and not only:
+        return {}
+    where, params = "", ()
+    if only is not None:
+        pl = sorted(only)
+        where = " WHERE path IN (%s)" % ",".join("?" * len(pl))
+        params = tuple(pl)
     hays = {}
-    for path, title in db.execute("SELECT path, title FROM files"):
+    for path, title in db.execute("SELECT path, title FROM files" + where, params):
         hays[path] = [(title or "").lower() + " " + path.lower()]
-    for path, heading, content in db.execute("SELECT path, heading, content FROM sections"):
+    for path, heading, content in db.execute(
+            "SELECT path, heading, content FROM sections" + where, params):
         if path in hays:
             hays[path].append(heading.lower())
             hays[path].append(content.lower())
     return {p: " ".join(parts) for p, parts in hays.items()}
+
+
+def sync_haystacks(db, changed=None, deleted=()):
+    """Materialize the per-doc lowercase haystack at build time.
+
+    Byte-identical to what build_haystacks() computes on the fly — search reads
+    it instead of re-lowering the whole corpus on every query.
+    """
+    fp = corpus_fingerprint(db)
+    row = db.execute("SELECT value FROM meta WHERE key='haystack_fp'").fetchone()
+    covered = db.execute("SELECT COUNT(*) FROM haystacks").fetchone()[0] == \
+        db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    if row and row[0] == fp and covered:
+        return  # corpus unchanged — a no-op update shouldn't rebuild the cache
+    if changed is None or not (row and covered):
+        # no delta to trust (first build, or the cache is already out of step)
+        db.execute("DELETE FROM haystacks")
+        rows = build_haystacks(db)
+    else:
+        stale = sorted(set(changed) | set(deleted))
+        for i in range(0, len(stale), 500):
+            chunk = stale[i : i + 500]
+            db.execute("DELETE FROM haystacks WHERE path IN (%s)" % ",".join("?" * len(chunk)),
+                       chunk)
+        rows = build_haystacks(db, only=set(changed))
+    db.executemany("INSERT OR REPLACE INTO haystacks VALUES(?,?)", rows.items())
+    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('haystack_fp', ?)", (fp,))
+
+
+def doc_haystacks(db):
+    """Prebuilt haystacks when they cover the corpus, else compute them live.
+
+    A partially-stale table (files indexed after the last sync) would silently
+    drop those docs from every ranking, so the row count is checked against
+    files rather than merely testing for emptiness.
+    """
+    row = db.execute("SELECT value FROM meta WHERE key='haystack_fp'").fetchone()
+    if row and row[0] == corpus_fingerprint(db):
+        cached = dict(db.execute("SELECT path, hay FROM haystacks"))
+        # the fingerprint covers files, not the cache table: a haystacks row lost
+        # on its own would otherwise drop that doc from every ranking silently
+        if len(cached) == db.execute("SELECT COUNT(*) FROM files").fetchone()[0]:
+            return cached
+    return build_haystacks(db)
 
 
 def query_idf(db, terms, hays=None):
@@ -1286,9 +1353,15 @@ def query_idf(db, terms, hays=None):
         hays = doc_haystacks(db)
     df = {t: 0 for t in terms}
     variants = {t: minimal_variants(term_variants(t)) for t in terms}
+    # one compiled alternation per term beats a Python any(v in hay ...) loop:
+    # the C regex engine scans each haystack once per term instead of once per
+    # (term, variant) pair. Same matches — verified byte-identical df/doc_hits.
+    pats = {t: re.compile("|".join(re.escape(v)
+            for v in sorted(vs, key=len, reverse=True)))
+            for t, vs in variants.items()}
     doc_hits = {}
     for path, hay in hays.items():
-        hits = {t for t in df if any(v in hay for v in variants[t])}
+        hits = {t for t in df if pats[t].search(hay)}
         if hits:
             doc_hits[path] = hits
             for t in hits:
@@ -1603,7 +1676,7 @@ def cmd_update(root, db, args):
     row = db.execute("SELECT value FROM meta WHERE key='parser_version'").fetchone()
     if (row[0] if row else None) != PARSER_VERSION:
         # cached rows predate the current parser — they'd silently miss new fields
-        for t in ("files", "sections", "links", "tags", "aliases", "img_alts"):
+        for t in ("files", "sections", "links", "tags", "aliases", "img_alts", "haystacks"):
             db.execute(f"DELETE FROM {t}")
         if has_fts(db):
             db.execute("DELETE FROM sections_fts")
@@ -1652,7 +1725,9 @@ def cmd_update(root, db, args):
     db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('pdf_name_only', ?)",
                (json.dumps(sorted(pdf_no)),))
     img_changed = rebuild_image_sections(db)
-    sync_fts(db, changed_rels + [p for p in img_changed if p not in deleted], deleted)
+    hay_changed = changed_rels + [p for p in img_changed if p not in deleted]
+    sync_fts(db, hay_changed, deleted)
+    sync_haystacks(db, hay_changed, deleted)
     db.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('skipped', ?)",
         (json.dumps(dict(skipped.most_common())),),
@@ -1693,10 +1768,29 @@ def backlink_counts(db):
     return counts
 
 
-def vault_health(db):
+def link_exists_on_disk(root, src, dst):
+    """True when an md/img link target is a real file that simply wasn't indexed.
+
+    `dst` is already vault-root-relative and `..`-collapsed by resolve_doc_link, so
+    anything still starting with '..' points outside the vault and is not ours to
+    judge. Percent-escapes are decoded because that is how they reach the disk.
+    """
+    if dst.startswith("../") or dst.startswith("/") or "://" in dst:
+        return False
+    cand = urllib.parse.unquote(dst)
+    try:
+        target = (Path(root) / cand).resolve()
+        target.relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return False
+    return target.is_file()
+
+
+def vault_health(db, root=None):
     stems = stem_map(db)
     known = {p for (p,) in db.execute("SELECT path FROM files")}
     connected, broken, broken_seen = set(), [], set()
+    unindexed, unindexed_seen = [], set()
     for src, dst, kind in db.execute(
         "SELECT src, dst, kind FROM links WHERE kind IN ('wiki','md','img')"
     ):
@@ -1706,6 +1800,14 @@ def vault_health(db):
             connected.add(target)
         elif not target:
             label = f"[[{dst}]]" if kind == "wiki" else dst
+            # a relative link into a dot-dir or an ignored path resolves on disk but
+            # was never indexed — calling that "target missing" is a false positive,
+            # so it gets its own state instead of polluting the broken count
+            if kind != "wiki" and root is not None and link_exists_on_disk(root, src, dst):
+                if (label, src) not in unindexed_seen:
+                    unindexed_seen.add((label, src))
+                    unindexed.append((label, src))
+                continue
             if (label, src) not in broken_seen:
                 broken_seen.add((label, src))
                 broken.append((label, src))
@@ -1719,6 +1821,7 @@ def vault_health(db):
     return {
         "orphans": sorted(known - connected),
         "broken": broken,
+        "unindexed": unindexed,
         "stale_notes": stale_notes,
         "stale_edges": len(edges["stale"]),
     }
@@ -1801,7 +1904,7 @@ def write_map(root, db):
         out += ["", "## Semantic notes " + f"({len(fresh)} fresh / {len(notes) - len(fresh)} stale)", ""]
         out += [f"- {q}" for q in fresh[:10]]
 
-    h = vault_health(db)
+    h = vault_health(db, root)
     out += ["", "## Health", ""]
     if h["orphans"]:
         sample = " · ".join(f"`{p}`" for p in h["orphans"][:5])
@@ -1815,6 +1918,11 @@ def write_map(root, db):
         out.append(f"- broken links (target missing): {len(h['broken'])} — {sample}{more}")
     else:
         out.append("- broken links: 0")
+    if h["unindexed"]:
+        sample = " · ".join(f"`{lbl}` in {src}" for lbl, src in h["unindexed"][:5])
+        more = f" · … +{len(h['unindexed']) - 5}" if len(h["unindexed"]) > 5 else ""
+        out.append(f"- links to unindexed files (present on disk, not in the index): "
+                   f"{len(h['unindexed'])} — {sample}{more}")
     out.append(
         f"- stale semantics: {h['stale_notes']} notes, {h['stale_edges']} edges"
         + (" — `wikimap notes --prune` / `wikimap edges --prune`"
@@ -1866,6 +1974,8 @@ WEAK_SCORE = 10
 LONG_QUERY = 6
 COVER_RATIO = 0.3
 RRF_K = 60
+DEAD_ECHO_TERMS = 5
+DEAD_ECHO_CHARS = 40
 TYPE_EXTS = {
     "md": {".md"},
     "html": HTML_EXTS,
@@ -1911,6 +2021,19 @@ def term_variants(term):
     return {v for v in vs if len(v) >= 2}
 
 
+def dead_echo(dead):
+    """Bounded echo of the terms that hit nothing.
+
+    An agent driving wikimap gets this line back into its own context, so a long
+    query must not be mirrored verbatim — cap both the per-term length and how
+    many terms are listed.
+    """
+    shown = [t if len(t) <= DEAD_ECHO_CHARS else t[:DEAD_ECHO_CHARS] + "…"
+             for t in dead[:DEAD_ECHO_TERMS]]
+    rest = len(dead) - len(shown)
+    return ", ".join(shown) + (f" … +{rest} more" if rest > 0 else "")
+
+
 def cmd_search(root, db, args):
     queries = args.query
 
@@ -1938,6 +2061,12 @@ def cmd_search(root, db, args):
         return hay_cache[0]
 
     def collect(section_rows, require_all, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs):
+        # existence tests over a section reduce to one compiled alternation per
+        # term (boolean only — the frequency term below still uses str.count,
+        # which is NOT regex-equivalent when variants overlap).
+        hit_re = {t: re.compile("|".join(re.escape(v)
+                  for v in sorted(vs, key=len, reverse=True)))
+                  for t, vs in hitvs.items()}
         # roll matches up to the DOCUMENT: plain terms scattered across several
         # sections of one doc are unioned, so a doc that mentions each query term
         # once (in different sections) still clears the coverage gate. The single
@@ -1981,8 +2110,9 @@ def cmd_search(root, db, args):
                         continue
                     in_title, alias_hit, in_path = doc_field
                     vs = hitvs[t]
-                    in_head = any(v in heading_l for v in vs)
-                    in_body = any(v in content_l for v in vs)
+                    rx = hit_re[t]
+                    in_head = rx.search(heading_l) is not None
+                    in_body = rx.search(content_l) is not None
                     if in_title or alias_hit or in_path or in_head or in_body:
                         sec_terms.add(t)
                         w = 1 + idf.get(t, 0)
@@ -2315,7 +2445,7 @@ def cmd_search(root, db, args):
     if not results and not matched_notes:
         print("no results")
         if dead:
-            print(f"~ no corpus hits for: {', '.join(dead)} — swap these for document vocabulary")
+            print(f"~ no corpus hits for: {dead_echo(dead)} — swap these for document vocabulary")
         return
     for pos, (nmatched, midf, score, path, line, heading, content) in enumerate(shown):
         if fused:
@@ -2357,7 +2487,7 @@ def cmd_search(root, db, args):
             for _, s in picked:
                 print(f"  {s[:160]}")
     if weak and dead:
-        print(f"~ no corpus hits for: {', '.join(dead)} — swap these for document vocabulary")
+        print(f"~ no corpus hits for: {dead_echo(dead)} — swap these for document vocabulary")
 
 
 def cmd_links(root, db, args):
@@ -2868,18 +2998,30 @@ def cmd_mv(root, db, args):
 
 def cmd_fix_links(root, db, args):
     stems = stem_map(db)
+    h = vault_health(db, root)
     items = []
-    for label, src in vault_health(db)["broken"]:
+    for label, src in h["broken"]:
         raw = label[2:-2] if label.startswith("[[") else label
         cands = difflib.get_close_matches(
             link_stem(raw), sorted(stems.keys()), n=3, cutoff=0.6
         )
         items.append({"link": label, "in": src, "candidates": [stems[c] for c in cands]})
+    unindexed = [{"link": lbl, "in": src} for lbl, src in h["unindexed"]]
     if args.json:
-        print(json.dumps({"broken": items}, ensure_ascii=False, indent=2))
+        print(json.dumps({"broken": items, "unindexed": unindexed},
+                         ensure_ascii=False, indent=2))
         return
+    def report_unindexed():
+        if not unindexed:
+            return
+        print(f"\n{len(unindexed)} link(s) to files that exist but aren't indexed "
+              "(dot-directory or .wikimapignore) — not broken, but they won't be searchable:")
+        for it in unindexed:
+            print(f"   {it['link']}  (in {it['in']})")
+
     if not items:
         print("no broken links")
+        report_unindexed()
         return
     for it in items:
         print(f"{it['link']}  (in {it['in']})")
@@ -2889,6 +3031,7 @@ def cmd_fix_links(root, db, args):
             print("   → no candidate")
     print(f"\n{len(items)} broken link(s). Suggestions only — fix by editing the doc, or use "
           "`wikimap mv` next time you relocate a file.")
+    report_unindexed()
 
 
 def cmd_doctor(root, db, args):
@@ -2927,7 +3070,7 @@ def cmd_doctor(root, db, args):
             if t not in ("note", "edge", "embed"):
                 unknown += 1
 
-    h = vault_health(db)
+    h = vault_health(db, root)
     files = {p: s for p, s in db.execute("SELECT path, sha FROM files")}
     stale_embeds = sum(1 for p, s in db.execute("SELECT path, sha FROM embeds")
                        if p in files and files[p] != s)
@@ -2950,7 +3093,8 @@ def cmd_doctor(root, db, args):
             "index": {"files": len(files), "pending": pending, "deleted": deleted},
             "semantics": {"lines": total_lines, "malformed": malformed,
                           "by_type": by_type, "unknown_types": unknown},
-            "links": {"broken": len(h["broken"]), "orphans": len(h["orphans"])},
+            "links": {"broken": len(h["broken"]), "unindexed": len(h["unindexed"]),
+                      "orphans": len(h["orphans"])},
             "stale": {"notes": h["stale_notes"], "edges": h["stale_edges"],
                       "embeds": stale_embeds},
             "healthy": not issues,
@@ -2962,7 +3106,8 @@ def cmd_doctor(root, db, args):
     print(f"semantics: {total_lines} record line(s)"
           + (f", {malformed} malformed" if malformed else "")
           + (f", {unknown} from a newer wikimap (kept as-is)" if unknown else ""))
-    print(f"links    : {len(h['broken'])} broken, {len(h['orphans'])} orphan doc(s)")
+    print(f"links    : {len(h['broken'])} broken, {len(h['orphans'])} orphan doc(s)"
+          + (f", {len(h['unindexed'])} to unindexed file(s)" if h["unindexed"] else ""))
     print(f"stale    : {h['stale_notes']} notes, {h['stale_edges']} edges, "
           f"{stale_embeds} embeds")
     if issues:

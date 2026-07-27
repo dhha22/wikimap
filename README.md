@@ -29,6 +29,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 - **Instant, free indexing.** Full build and incremental updates finish in well under a second, with **zero LLM tokens** — graphify needs minutes and millions of tokens for the same vault.
 - **More accurate search, not less.** On 135 blind questions (written by agents that only read the corpus, verified before any query ran), wikimap beats a freshly-built graphify graph on recall and puts the answer line right in the snippet.
+- **Fast search, and it stays that way.** Queries run in tens of milliseconds on a 636-document vault — 1.3.0 made search ~1.5× faster than 1.2.0 with **byte-identical rankings**, verified across 600 comparisons.
 - **Deterministic and self-cleaning.** Same input → byte-identical index; deleted files disappear on their own. No ghost nodes, no reshuffled results between runs.
 - **Any language, any format.** No hardcoded stopword list, so Korean/English/mixed all work; indexes Markdown plus `.txt/.rst/.org/.adoc`, HTML, PDF, and image filenames.
 
@@ -37,10 +38,11 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 | Full index build | **sub-second, $0** | minutes + LLM cost |
 | Update after edits | **~0.07 s, 0 tokens** | ~95 s + tens of thousands of tokens |
 | Search accuracy (recall@5, 135 blind Qs) | **0.83** | 0.57 |
+| Search latency (636-doc vault) | **~70 ms/query** | — |
 | Snippet shows the answer line | yes (section + line) | no (entity labels only) |
 | Determinism | byte-identical every run | non-deterministic graphs |
 
-<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). The test suite is 136 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
+<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). Search latency is the in-process query cost, excluding the fixed ~58 ms interpreter+import that every CLI invocation pays. The test suite is 154 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
 
 **Fan-out for the hard queries.** Pass the question *plus* a rewrite or two in one call and the rankings fuse, so a document several phrasings agree on rises to the top:
 
@@ -122,7 +124,7 @@ Everything else, grouped by what it's for:
 | | `notes` / `edges` | List what's cached; stale entries hide themselves |
 | **Semantic search** | `embed set` / `semsearch` | For questions that share *no words* with the answer. Your agent supplies the vectors (any model); wikimap just stores and ranks them |
 | **Housekeeping** | `mv <old> <new>` | Rename a doc and rewrite every link pointing at it |
-| | `fix-links` | Suggest targets for broken links (never auto-applies) |
+| | `fix-links` | Suggest targets for broken links (never auto-applies); lists links to files that exist but aren't indexed separately |
 | | `doctor` | Read-only integrity check: index freshness, semantics validity, broken links, stale pins — one verdict |
 | | `install` | Register as an agent skill, or `--hook` to auto-`update` on every commit |
 | | `migrate` | Move a graphify vault over in one command (see below). Dry run unless `--apply` |

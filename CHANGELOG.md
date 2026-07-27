@@ -2,6 +2,26 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.3.0 — 2026-07-27
+
+### Changed
+
+- **Search got ~1.5× faster with byte-identical rankings.** Two hot loops that re-derived the same work on every query were the cost; neither changes what search returns. Verified on a frozen 636-document snapshot across a 150-question blind set (independent agents authored the queries, versions run in isolated processes with alternating order over 4 rounds): **0 ranking differences in 600 comparisons**, recall@1/@5/@10 and MRR identical to the digit, and every query faster (sign test p ≈ 1e-45). Cumulative search latency 104 ms (1.2.0) → 68 ms; per-query median improvement 28%, worst case still +1.6% (no regressions). CLI round-trip, which carries a fixed ~58 ms interpreter+import cost, moves 162 → 141 ms.
+  - **Per-document haystacks are built at index time, not per query.** `doc_haystacks` used to read every section and lower-case the whole corpus on each search (~30 ms/query here); it now serves a prebuilt `haystacks` table whose text is byte-identical to the on-the-fly computation. A corpus fingerprint (count + sha of the files' sha column) plus a row-count check falls back to live computation whenever the cache could be stale, so a partially-updated index can never silently drop a document from results. The table is maintained incrementally — a no-op or single-file `update` costs the same as before.
+  - **Term-variant matching uses a compiled alternation instead of a Python `any(v in text ...)` loop.** `query_idf` (document-frequency counting) and `collect` (per-section existence tests) matched each term's variants by scanning the text once per variant; they now compile one regex alternation per term and let the C engine scan once. Frequency scoring is deliberately left on `str.count` — overlapping variants (a stem and its inflected form) double-count under `str.count` but not under a single `findall`, so switching it would change scores; a regression test pins this apart.
+
+### Fixed
+
+- **A stale prebuilt haystack can no longer narrow search silently.** If files were indexed after the last haystack sync (or a cache row was lost), the affected documents would drop out of every ranking. Search now checks the cache covers the corpus before trusting it, and rebuilds otherwise. Regression tests cover the dropped-row, stale-fingerprint, and edited-document cases.
+- **Links to files that exist but aren't indexed are no longer reported as broken** ([#1](https://github.com/dhha22/wikimap/issues/1)). Health checked link targets against the indexed set only, so a link into a dot-directory (`.github/tmpl.md`) or an `.wikimapignore`d path was labelled "target missing" even though the file is right there on disk. On the reporter's vault every one of the 4 reported broken links was a false positive, which made the whole line unusable as a signal. Such targets now get their own state — `links to unindexed files` in `MAP.md`, an `unindexed` array in `fix-links --json`, and an `unindexed` count in `doctor --json` — so a genuinely dead link stays visible and actionable while the false positives stop drowning it. `doctor` no longer counts them as issues (nothing is wrong), but still prints them, because "present but unsearchable" is worth knowing. Targets outside the vault root are never probed on disk and stay broken. Present since 0.4.0, when the health report was introduced.
+- **The no-match line no longer echoes a long query back verbatim** ([#1](https://github.com/dhha22/wikimap/issues/1)). `~ no corpus hits for: …` printed every dead term in full — a 400-character query produced a 461-character line, which an agent driving wikimap then fed straight back into its own context. Each term is now capped at 40 characters and at most 5 are listed (`… +N more`). `--json` still carries the exact terms; the bound is only on the human/agent-facing line.
+
+### Decided against
+
+- **A resident search daemon.** A Unix-socket daemon that keeps the DB and caches warm reaches 2.3× (socket-direct) or 1.6× (thin-client subprocess), but the fixed interpreter/import cost it removes is the same ~58 ms the CLI pays, and the win costs a resident process plus cache-invalidation plumbing on every vault change — the same staleness class fixed above, made load-bearing. The in-process regex work above captures most of the realistic gain with zero lifecycle cost. Kept as a possible opt-in `serve` mode, not a default.
+- **FTS-derived document frequency.** SQLite's trigram tokenizer can't match tokens shorter than 3 characters (most Korean content words) and diverges from the substring df on title/path-only hits; a single wrong df shifts idf and the ranking. Rejected.
+- **Regex-batched section early-exit.** 84% of sections contain no query term on a long-query full scan, but the combined-alternation gate that skips them duplicates the per-term regex work already running, so it netted no measurable gain. Dropped.
+
 ## 1.2.0 — 2026-07-21
 
 ### Changed

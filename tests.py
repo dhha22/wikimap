@@ -217,6 +217,26 @@ class TestWeakSignal(VaultTest):
         self.assertTrue(data["partial"])
         self.assertTrue(data["weak"])
 
+    def test_dead_term_echo_is_bounded(self):
+        # issue #1: the no-match line is fed straight back into a driving agent's
+        # context, so neither one long term nor many terms may echo verbatim
+        long_term = "z" * 400
+        out = run(self.root, "search", long_term)
+        echo = [l for l in out.splitlines() if "no corpus hits" in l][0]
+        self.assertLess(len(echo), 150, echo)
+        self.assertIn("…", echo)
+        self.assertNotIn(long_term, echo)
+        many = run(self.root, "search", " ".join(f"qqz{i}" for i in range(12)))
+        echo = [l for l in many.splitlines() if "no corpus hits" in l][0]
+        self.assertIn("more", echo)
+        self.assertLess(len(echo), 150, echo)
+
+    def test_json_keeps_full_term_text(self):
+        # the bound is a human/agent-context concern; machine output stays exact
+        long_term = "z" * 400
+        data = json.loads(run(self.root, "search", long_term, "--json"))
+        self.assertEqual(data["terms"][0]["term"], long_term)
+
 
 class TestSnippetContext(VaultTest):
     """top-3 results carry ±2 lines of context around each pick — the answer line
@@ -278,6 +298,50 @@ class TestHealth(VaultTest):
         self.assertIn("broken links (target missing): 2", map_md)
         self.assertIn("`[[ghost-doc]]` in specs/auth-spec.md", map_md)
 
+    def test_existing_but_unindexed_target_is_not_broken(self):
+        # issue #1: a link into a dot-directory resolves on disk but is never
+        # indexed — reporting it as "target missing" made Health 100% noise
+        write(self.root, ".github/tmpl.md", "# T")
+        write(self.root, "notes/dotlink.md", "# D\n\n[t](../.github/tmpl.md)")
+        run(self.root, "update")
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertIn("links to unindexed files", map_md)
+        self.assertIn("`.github/tmpl.md` in notes/dotlink.md", map_md)
+        # the genuinely-missing targets from the base vault must survive
+        self.assertIn("broken links (target missing): 2", map_md)
+        self.assertNotIn("`.github/tmpl.md` in notes/dotlink.md — broken", map_md)
+
+    def test_ignored_path_target_is_not_broken(self):
+        write(self.root, "private/secret.md", "# S")
+        write(self.root, "notes/iglink.md", "# I\n\n[s](../private/secret.md)")
+        write(self.root, ".wikimapignore", "private/\n")
+        run(self.root, "update")
+        map_md = (self.root / "MAP.md").read_text(encoding="utf-8")
+        self.assertIn("`private/secret.md` in notes/iglink.md", map_md)
+        self.assertIn("links to unindexed files", map_md)
+
+    def test_unindexed_split_reaches_fix_links_and_doctor(self):
+        write(self.root, ".github/tmpl.md", "# T")
+        write(self.root, "notes/dotlink.md", "# D\n\n[t](../.github/tmpl.md)")
+        run(self.root, "update")
+        fl = json.loads(run(self.root, "fix-links", "--json"))
+        self.assertEqual([i["link"] for i in fl["unindexed"]], [".github/tmpl.md"])
+        self.assertNotIn(".github/tmpl.md", [i["link"] for i in fl["broken"]])
+        doc = json.loads(run(self.root, "doctor", "--json"))
+        self.assertEqual(doc["links"]["unindexed"], 1)
+
+    def test_link_escaping_the_vault_stays_broken(self):
+        # the target really does exist on disk, but it sits outside the vault —
+        # the on-disk probe must not reach past the root and excuse it
+        (self.tmp / "sibling").mkdir(exist_ok=True)
+        (self.tmp / "sibling" / "target.md").write_text("S", encoding="utf-8")
+        write(self.root, "notes/esc.md", "# E\n\n[y](../../sibling/target.md)")
+        run(self.root, "update")
+        fl = json.loads(run(self.root, "fix-links", "--json"))
+        self.assertEqual([i["link"] for i in fl["unindexed"]], [],
+                         "a target outside the vault must not be excused as unindexed")
+        self.assertIn("../../sibling/target.md", [i["link"] for i in fl["broken"]])
+
     def test_edge_rescues_orphan_and_goes_stale(self):
         run(self.root, "update")
         run(self.root, "edge", "add", "--src", "notes/orphan-note.md",
@@ -303,6 +367,123 @@ class TestNotes(VaultTest):
 
 
 @unittest.skipUnless(has_trigram(), "sqlite without fts5 trigram (<3.34)")
+class TestRegexMatchEquivalence(VaultTest):
+    """query_idf and collect match term variants with a compiled alternation
+    instead of a Python `any(v in text ...)` loop. The alternation must be a
+    drop-in for existence (boolean) matching, and the frequency score must NOT
+    be switched to it — overlapping variants double-count under str.count but
+    not under a single findall, so they are deliberately kept apart."""
+
+    def _wm(self):
+        import importlib
+        sys.path.insert(0, str(Path(WIKIMAP).parent))
+        import wikimap
+        return importlib.reload(wikimap)
+
+    def test_regex_df_equals_substring_df(self):
+        run(self.root, "update")
+        W = self._wm()
+        db = W.open_db(self.root)
+        hays = W.doc_haystacks(db)
+
+        def substr_df(terms):
+            df = {t: 0 for t in terms}
+            var = {t: W.minimal_variants(W.term_variants(t)) for t in terms}
+            hits_by_doc = {}
+            for path, hay in hays.items():
+                hit = {t for t in df if any(v in hay for v in var[t])}
+                if hit:
+                    hits_by_doc[path] = hit
+                    for t in hit:
+                        df[t] += 1
+            return df, hits_by_doc
+
+        for terms in (["인증"], ["로그인", "토큰"], ["결제", "위젯", "billing"],
+                      ["REQ-01", "세션"], ["payment", "retries", "checkout"]):
+            idf, _, df, doc_hits = W.query_idf(db, terms, hays)
+            exp_df, exp_hits = substr_df(terms)
+            self.assertEqual(df, exp_df, terms)
+            self.assertEqual(doc_hits, exp_hits, terms)
+
+    def test_search_output_unchanged_by_regex_path(self):
+        # a query that exercises heading, body, title and path matching at once
+        run(self.root, "update")
+        for q in ("로그인 정책", "토큰 갱신", "결제 위젯", "billing widgets payment",
+                  "인증 스펙 세션 만료"):
+            out = run(self.root, "search", q, "--json")
+            self.assertIn('"results"', out)  # smoke: valid structured output
+
+    def test_frequency_uses_count_not_regex(self):
+        # overlapping variants (a stem and its suffixed form) must still be
+        # summed by str.count, which double-counts a shared span — a single
+        # alternation's findall would under-count and change the score. Guard
+        # the invariant at the primitive level so a future "just use regex"
+        # refactor of the frequency term fails loudly here.
+        import re
+        content = "테스트 테스트한 테스트했다"
+        variants = ["테스", "테스트", "테스트한"]
+        by_count = sum(content.count(v) for v in variants)
+        by_regex = len(re.compile(
+            "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+        ).findall(content))
+        self.assertNotEqual(by_count, by_regex)
+        self.assertEqual(by_count, 7)   # 테스:3, 테스트:3, 테스트한:1 (overlapping)
+        self.assertEqual(by_regex, 3)   # one match per token, no overlap
+
+
+class TestHaystackCache(VaultTest):
+    """The prebuilt haystack must never narrow what search can see."""
+
+    def _db(self):
+        return sqlite3.connect(self.root / ".wikimap" / "index.db")
+
+    def test_cache_matches_live_after_update(self):
+        run(self.root, "update")
+        sys.path.insert(0, str(Path(WIKIMAP).parent))
+        import wikimap as W
+        db = self._db()
+        try:
+            self.assertEqual(W.doc_haystacks(db), W.build_haystacks(db))
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM haystacks").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+        finally:
+            db.close()
+
+    def test_dropped_row_falls_back_instead_of_dropping_a_doc(self):
+        write(self.root, "notes/needle-doc.md", "# needle\n\nzxqhaystacktoken here\n")
+        run(self.root, "update")
+        self.assertIn("needle-doc.md", run(self.root, "search", "zxqhaystacktoken"))
+        db = self._db()
+        db.execute("DELETE FROM haystacks WHERE path='notes/needle-doc.md'")
+        db.commit()
+        db.close()
+        # a lost cache row must not make the doc invisible
+        self.assertIn("needle-doc.md", run(self.root, "search", "zxqhaystacktoken"))
+
+    def test_stale_fingerprint_falls_back(self):
+        run(self.root, "update")
+        db = self._db()
+        db.execute("UPDATE meta SET value='0:deadbeef' WHERE key='haystack_fp'")
+        db.commit()
+        db.close()
+        sys.path.insert(0, str(Path(WIKIMAP).parent))
+        import wikimap as W
+        db = self._db()
+        try:
+            self.assertEqual(W.doc_haystacks(db), W.build_haystacks(db))
+        finally:
+            db.close()
+
+    def test_edited_doc_is_searchable_by_its_new_text(self):
+        write(self.root, "notes/mutable.md", "# mutable\n\noldtokenzzz\n")
+        run(self.root, "update")
+        write(self.root, "notes/mutable.md", "# mutable\n\nnewtokenzzz\n")
+        run(self.root, "update")
+        self.assertIn("mutable.md", run(self.root, "search", "newtokenzzz"))
+        self.assertIn("no results", run(self.root, "search", "oldtokenzzz"))
+
+
 class TestFtsAtScale(VaultTest):
     def test_fts_kicks_in_and_stays_in_sync(self):
         for i in range(520):

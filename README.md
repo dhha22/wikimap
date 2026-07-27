@@ -68,6 +68,8 @@ cd your-vault && python3 wikimap.py update
 
 Either way, `wikimap install` (or `python3 wikimap.py install`) registers it with your AI agents — see below. Requires Python 3.8+, nothing else.
 
+To upgrade: `pipx upgrade wikimap` (or `uv tool upgrade wikimap` / `pip install -U wikimap`); re-run the `curl` above if you vendored the single file. wikimap never phones home to check for a new version — it makes no network calls at all — so upgrades are always yours to trigger.
+
 ## Use with any AI agent
 
 wikimap is not tied to one assistant. The core is a plain CLI (`--json` on every query command), and registration follows the open standards:

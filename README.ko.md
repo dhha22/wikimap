@@ -68,6 +68,8 @@ cd your-vault && python3 wikimap.py update
 
 어느 쪽이든 `wikimap install`(또는 `python3 wikimap.py install`)이 AI 에이전트들에 등록해 줍니다 — 아래 참조. Python 3.8+ 외에는 아무것도 필요 없습니다.
 
+업그레이드는 `pipx upgrade wikimap` (또는 `uv tool upgrade wikimap` / `pip install -U wikimap`). 파일 하나만 복사해 쓰고 있다면 위 `curl`을 다시 실행하세요. wikimap은 새 버전이 있는지 확인하려고 서버에 연결하지 않습니다 — 애초에 네트워크 호출이 하나도 없습니다 — 그래서 업그레이드는 항상 사용자가 직접 실행하는 방식입니다.
+
 ## 어떤 AI 에이전트와도 사용
 
 wikimap은 특정 어시스턴트에 종속되지 않습니다. 코어는 평범한 CLI(모든 질의 명령에 `--json`)이고, 등록은 오픈 표준을 따릅니다:

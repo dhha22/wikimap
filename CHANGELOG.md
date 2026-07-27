@@ -2,6 +2,16 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.4.0 — 2026-07-27
+
+### Added
+
+- **Opt-in update check.** `update` and `doctor` can tell you when a newer release exists — off unless you set `WIKIMAP_CHECK_UPDATE=1`, because "no network calls, works offline, auditable" is a property worth keeping by default rather than one to erode for convenience. When enabled it queries PyPI **at most once a day** (the timestamp lives in the disposable `index.db`, so deleting the cache just resets the clock), **times out after 2 seconds**, and is **silent on every failure** — no network, DNS, proxy, outage, or malformed response can make a vault command fail, hang, or print a traceback. The timestamp is written *before* the request, so an unreachable endpoint costs the timeout once a day rather than on every invocation. `WIKIMAP_NO_UPDATE_CHECK=1` overrides the opt-in back off, for locked-down environments that want the switch pinned. `doctor --json` is deliberately unchanged: an advisory is not a vault problem, and it never affects `healthy`.
+
+### Fixed
+
+- **`tests.py` ran only 157 of its 166 tests.** Two test classes had been appended below the `if __name__ == "__main__"` guard, so unittest never collected them — including the empty-alternation guard shipped in 1.3.1. Both are now above the guard and run. No product code was wrong; the affected assertions pass, they just weren't being executed.
+
 ## 1.3.1 — 2026-07-27
 
 ### Fixed

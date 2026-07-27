@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -85,6 +85,8 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 `search`/`links`/`path`/`suggest`/`notes`/`edges`/`semsearch`/`doctor` accept `--json` for structured output — prefer it when a script consumes the result. `search --json` carries `weak: true` when the query contains dead vocabulary (a `df: 0` term nothing in the vault contains), the result set is empty or a short query fell back to a partial match, or the top score is low — the signal to fan out with rewrites (rule 1) or try the semantic path (rule 9). It also carries `terms: [{term, df}]` — the document frequency of each query token in this corpus: when reformulating, replace exactly the `df: 0` terms and keep the ones that hit. `search --compact` returns one best line per result — the diet mode for multi-query loops.
 
 Notes and edges live in `.wikimap/semantics.jsonl` (append-only, git-committable — the source of truth); `.wikimap/index.db` is a disposable cache rebuilt from files + that jsonl.
+
+wikimap makes no network calls by default. Set `WIKIMAP_CHECK_UPDATE=1` and `update`/`doctor` will mention a newer release (PyPI, at most once a day, 2s timeout, silent on any failure); `WIKIMAP_NO_UPDATE_CHECK=1` forces it back off.
 
 ## Rules for the agent
 
@@ -1782,6 +1784,83 @@ def cmd_update(root, db, args):
         + f" | notes: {fresh} fresh, {stale} stale | "
         f"edges: {len(e['fresh'])} fresh, {len(e['stale'])} stale | {map_note}"
     )
+    note = latest_version_note(db)
+    if note:
+        print(note)
+
+
+UPDATE_CHECK_URL = "https://pypi.org/pypi/wikimap/json"
+UPDATE_CHECK_INTERVAL = 86400  # at most one request per day
+UPDATE_CHECK_TIMEOUT = 2.0
+
+
+def parse_version(v):
+    """(1, 3, 10, 0) from '1.3.10' — numeric compare, so 1.3.10 > 1.3.9.
+
+    A trailing suffix marks a prerelease: '1.4.0rc1' → (1, 4, 0, -1), which sorts
+    below the final '1.4.0' → (1, 4, 0, 0). Returns None when nothing parses,
+    which callers treat as "don't compare".
+    """
+    parts, pre = [], 0
+    for chunk in str(v).strip().split("."):
+        num = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            num += ch
+        if len(num) != len(chunk):
+            pre = -1  # rc/dev/post tail — anything but a bare number
+        parts.append(int(num) if num else -1)
+    if not any(p >= 0 for p in parts):
+        return None
+    return tuple(parts) + (pre,)
+
+
+def update_check_enabled():
+    """Off unless explicitly switched on, and never in a non-interactive pipe.
+
+    wikimap makes no network calls by default — the whole point of the tool is
+    that it works offline and is auditable. Opting in is a deliberate act.
+    """
+    if os.environ.get("WIKIMAP_NO_UPDATE_CHECK"):
+        return False
+    return os.environ.get("WIKIMAP_CHECK_UPDATE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def latest_version_note(db, now=None):
+    """A one-line 'newer version available' note, or None.
+
+    Every failure mode is silent: no network, DNS down, proxy, timeout, garbage
+    JSON, PyPI outage. An index command must never fail or hang because a
+    version check couldn't reach the internet.
+    """
+    if not update_check_enabled():
+        return None
+    now = int(time.time() if now is None else now)
+    row = db.execute("SELECT value FROM meta WHERE key='update_check_at'").fetchone()
+    try:
+        last = int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        last = 0
+    if now - last < UPDATE_CHECK_INTERVAL:
+        return None
+    # stamp before the request: a hanging or failing endpoint must not cause a
+    # retry on every single invocation
+    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('update_check_at', ?)", (str(now),))
+    db.commit()
+    try:
+        import urllib.request
+        req = urllib.request.Request(UPDATE_CHECK_URL, headers={
+            "User-Agent": f"wikimap/{VERSION}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=UPDATE_CHECK_TIMEOUT) as r:
+            latest = json.loads(r.read().decode("utf-8"))["info"]["version"]
+    except Exception:
+        return None
+    mine, theirs = parse_version(VERSION), parse_version(latest)
+    if not mine or not theirs or theirs <= mine:
+        return None
+    return (f"~ wikimap {latest} is available (you have {VERSION}) — "
+            "pipx upgrade wikimap")
 
 
 def backlink_counts(db):
@@ -3142,6 +3221,10 @@ def cmd_doctor(root, db, args):
             print(f"  - {i}")
     else:
         print("healthy — nothing to do")
+    # a version note is not a vault problem: it never affects `healthy`
+    note = latest_version_note(db)
+    if note:
+        print(note)
 
 
 def install_hook(root: Path):

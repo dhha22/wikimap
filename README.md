@@ -42,7 +42,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 | Snippet shows the answer line | yes (section + line) | no (entity labels only) |
 | Determinism | byte-identical every run | non-deterministic graphs |
 
-<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). Search latency is the in-process query cost, excluding the fixed ~58 ms interpreter+import that every CLI invocation pays. The test suite is 157 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
+<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). Search latency is the in-process query cost, excluding the fixed ~58 ms interpreter+import that every CLI invocation pays. The test suite is 166 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
 
 **Fan-out for the hard queries.** Pass the question *plus* a rewrite or two in one call and the rankings fuse, so a document several phrasings agree on rises to the top:
 
@@ -68,7 +68,9 @@ cd your-vault && python3 wikimap.py update
 
 Either way, `wikimap install` (or `python3 wikimap.py install`) registers it with your AI agents — see below. Requires Python 3.8+, nothing else.
 
-To upgrade: `pipx upgrade wikimap` (or `uv tool upgrade wikimap` / `pip install -U wikimap`); re-run the `curl` above if you vendored the single file. wikimap never phones home to check for a new version — it makes no network calls at all — so upgrades are always yours to trigger.
+To upgrade: `pipx upgrade wikimap` (or `uv tool upgrade wikimap` / `pip install -U wikimap`); re-run the `curl` above if you vendored the single file.
+
+**wikimap makes no network calls unless you ask it to.** If you'd like `update` and `doctor` to mention when a newer release exists, set `WIKIMAP_CHECK_UPDATE=1`; it then queries PyPI at most once a day, times out in 2 seconds, and stays silent on any failure. `WIKIMAP_NO_UPDATE_CHECK=1` overrides it back off. Unset — the default — nothing is ever sent.
 
 ## Use with any AI agent
 

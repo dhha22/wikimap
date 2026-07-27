@@ -42,7 +42,7 @@ wikimap은 순서를 뒤집습니다: **구조는 지금 파싱하고, 의미는
 | 스니펫에 정답 줄 표시 | 예 (섹션 + 라인) | 아니오 (엔티티 라벨만) |
 | 결정성 | 실행마다 바이트 동일 | 비결정적 그래프 |
 
-<sub>한/영 vault(M 시리즈 Mac) 실측입니다. 전체 방법론과 사전 등록 블라인드 벤치마크는 [changelog](CHANGELOG.md)에 있습니다. 검색 지연은 in-process 질의 비용이며, CLI 호출마다 드는 고정 비용(인터프리터+import 약 58ms)은 제외한 값입니다. 테스트 157건(stdlib만), macOS·Linux·Windows / Python 3.8~3.13.</sub>
+<sub>한/영 vault(M 시리즈 Mac) 실측입니다. 전체 방법론과 사전 등록 블라인드 벤치마크는 [changelog](CHANGELOG.md)에 있습니다. 검색 지연은 in-process 질의 비용이며, CLI 호출마다 드는 고정 비용(인터프리터+import 약 58ms)은 제외한 값입니다. 테스트 166건(stdlib만), macOS·Linux·Windows / Python 3.8~3.13.</sub>
 
 **어려운 질의는 fan-out.** 질문에 다른 표현 1~2개를 얹어 한 번에 넘기면 랭킹이 합쳐져, 여러 표현이 공통으로 지목한 문서가 위로 올라옵니다:
 
@@ -68,7 +68,9 @@ cd your-vault && python3 wikimap.py update
 
 어느 쪽이든 `wikimap install`(또는 `python3 wikimap.py install`)이 AI 에이전트들에 등록해 줍니다 — 아래 참조. Python 3.8+ 외에는 아무것도 필요 없습니다.
 
-업그레이드는 `pipx upgrade wikimap` (또는 `uv tool upgrade wikimap` / `pip install -U wikimap`). 파일 하나만 복사해 쓰고 있다면 위 `curl`을 다시 실행하세요. wikimap은 새 버전이 있는지 확인하려고 서버에 연결하지 않습니다 — 애초에 네트워크 호출이 하나도 없습니다 — 그래서 업그레이드는 항상 사용자가 직접 실행하는 방식입니다.
+업그레이드는 `pipx upgrade wikimap` (또는 `uv tool upgrade wikimap` / `pip install -U wikimap`). 파일 하나만 복사해 쓰고 있다면 위 `curl`을 다시 실행하세요.
+
+**wikimap은 요청하지 않는 한 네트워크를 쓰지 않습니다.** 새 버전이 나왔을 때 `update`·`doctor`가 알려주길 원한다면 `WIKIMAP_CHECK_UPDATE=1`을 설정하세요. 하루 최대 1회 PyPI를 조회하고, 2초 안에 타임아웃하며, 실패하면 조용히 넘어갑니다. `WIKIMAP_NO_UPDATE_CHECK=1`로 다시 끌 수 있습니다. 설정하지 않으면(기본값) 아무것도 전송하지 않습니다.
 
 ## 어떤 AI 에이전트와도 사용
 

@@ -1956,10 +1956,6 @@ class TestMigrateFromGraphify(VaultTest):
         self.assertIn("no graphify artifacts found", out)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestEmptyAlternationGuard(VaultTest):
     """the two term-variant matchers compile "|".join(variants); an empty variant
     set would yield "" — a pattern that matches EVERYTHING, the exact inverse of
@@ -1973,3 +1969,98 @@ class TestEmptyAlternationGuard(VaultTest):
         self.assertIsNone(re.compile(pat).search("anything at all"))
         self.assertIsNotNone(re.compile("").search("anything at all"),
                              "sanity: the unguarded empty pattern really does match all")
+
+
+class TestUpdateCheck(VaultTest):
+    """opt-in only. wikimap makes no network calls unless explicitly switched on —
+    that promise is in the README, so the default path is what matters most here."""
+
+    def setUp(self):
+        super().setUp()
+        run(self.root, "update")
+
+    def tearDown(self):
+        for k in ("WIKIMAP_CHECK_UPDATE", "WIKIMAP_NO_UPDATE_CHECK"):
+            os.environ.pop(k, None)
+
+    def test_disabled_by_default(self):
+        import wikimap
+        os.environ.pop("WIKIMAP_CHECK_UPDATE", None)
+        self.assertFalse(wikimap.update_check_enabled())
+
+    def test_env_toggles(self):
+        import wikimap
+        for val, want in (("1", True), ("true", True), ("on", True), ("YES", True),
+                          ("0", False), ("", False), ("nope", False)):
+            os.environ["WIKIMAP_CHECK_UPDATE"] = val
+            self.assertEqual(wikimap.update_check_enabled(), want, repr(val))
+
+    def test_kill_switch_wins(self):
+        import wikimap
+        os.environ["WIKIMAP_CHECK_UPDATE"] = "1"
+        os.environ["WIKIMAP_NO_UPDATE_CHECK"] = "1"
+        self.assertFalse(wikimap.update_check_enabled())
+
+    def test_default_run_says_nothing(self):
+        out = run(self.root, "update", env={"WIKIMAP_CHECK_UPDATE": ""})
+        self.assertNotIn("is available", out)
+
+    def test_unreachable_endpoint_is_silent_and_harmless(self):
+        # a vault command must never fail, hang, or traceback because a version
+        # check could not reach the network (air-gapped machines, proxies)
+        src = Path(WIKIMAP).read_text(encoding="utf-8").replace(
+            'UPDATE_CHECK_URL = "https://pypi.org/pypi/wikimap/json"',
+            'UPDATE_CHECK_URL = "http://127.0.0.1:9/nope"')
+        alt = self.tmp / "wm_dead.py"
+        alt.write_text(src, encoding="utf-8")
+        e = dict(os.environ); e["WIKIMAP_CHECK_UPDATE"] = "1"
+        p = subprocess.run([sys.executable, str(alt), "--root", str(self.root), "update"],
+                           capture_output=True, text=True, encoding="utf-8", env=e)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("files indexed", p.stdout)
+        self.assertNotIn("Traceback", p.stdout + p.stderr)
+        self.assertNotIn("is available", p.stdout)
+
+    def test_version_compare(self):
+        import wikimap
+        pv = wikimap.parse_version
+        self.assertGreater(pv("1.3.10"), pv("1.3.9"))   # numeric, not lexical
+        self.assertGreater(pv("1.4.0"), pv("1.3.99"))
+        self.assertLess(pv("1.4.0rc1"), pv("1.4.0"))
+        self.assertIsNone(pv("nonsense"))
+
+    def test_note_is_cached_for_a_day(self):
+        import wikimap
+        os.environ["WIKIMAP_CHECK_UPDATE"] = "1"
+        db = wikimap.open_db(self.root)
+        try:
+            now = 1_000_000
+            db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(\'update_check_at\', ?)",
+                       (str(now),))
+            db.commit()
+            # inside the window it returns without touching the network at all
+            self.assertIsNone(wikimap.latest_version_note(db, now=now + 60))
+        finally:
+            db.close()
+
+    def test_failed_check_does_not_retry_next_run(self):
+        # the timestamp is stamped BEFORE the request, so an endpoint that hangs
+        # costs the timeout once a day, not on every single invocation
+        import wikimap
+        os.environ["WIKIMAP_CHECK_UPDATE"] = "1"
+        db = wikimap.open_db(self.root)
+        try:
+            saved = wikimap.UPDATE_CHECK_URL
+            wikimap.UPDATE_CHECK_URL = "http://127.0.0.1:9/nope"
+            now = 2_000_000
+            self.assertIsNone(wikimap.latest_version_note(db, now=now))
+            row = db.execute(
+                "SELECT value FROM meta WHERE key=\'update_check_at\'").fetchone()
+            self.assertEqual(int(row[0]), now, "a failed check must still stamp the clock")
+        finally:
+            wikimap.UPDATE_CHECK_URL = saved
+            db.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

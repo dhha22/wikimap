@@ -2,6 +2,15 @@
 
 All notable changes to wikimap. Versions follow [semantic versioning](https://semver.org/) — see [Stability](README.md#stability) for what exactly is covered by that promise.
 
+## 1.5.0 — 2026-10-14
+
+### Changed
+
+- **`index.db` is ~3x smaller.** The trigram FTS5 table (`sections_fts`) is gone. It stored a second copy of every section plus a trigram index, and together those came to 61 MB of a 92 MB index on a 1,074-document vault. Since 1.3.0 every search already loads the per-document haystacks into memory to compute idf, and scanning them for the AND pre-filter takes 3–6 ms per term, while the FTS lookup took 2–50 ms. The table was costing disk space and buying no speed. Measured on that vault: an existing index shrinks **91.8 → 29.4 MB** on its first `update` (the legacy table is dropped and the file is `VACUUM`ed once, 0.46 s). A from-scratch build drops **4.39 s → 2.31 s / 80.3 → 29.7 MB**. The pre-filter still falls back to a full scan in the same cases as before (fewer than 500 docs, or a term shorter than 3 characters), so rankings do not move.
+- **Search reads only the sections that can still match.** `query_idf` already records which documents contain which query terms (`doc_hits`), and `collect` always discards a document with no plain-term hit. Short queries need every term, and long or relaxed queries need at least one. Search now loads only the sections of documents that pass that test, instead of all 15k sections. Most of the gain is on queries the old pre-filter skipped: two-character Korean terms and conversational questions (69% of the benchmark queries). Rows are still visited in table order, so near-tie ordering is unchanged. In-process search latency: median **115 → 59 ms**, total over 137 queries 16.0 → 11.2 s. The p90 barely moves (167 → 158 ms), because queries built from common terms still touch most of the corpus.
+
+Both changes were verified against 1.4.0 on that vault with 137 queries: random headings, 1–4 word combinations including two-character terms, field filters, conversational questions, and a no-hit query. Text and `--json` output were compared, and **0 of 274 outputs differed**.
+
 ## 1.4.0 — 2026-07-27
 
 ### Added

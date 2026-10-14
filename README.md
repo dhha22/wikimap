@@ -42,7 +42,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 | Snippet shows the answer line | yes (section + line) | no (entity labels only) |
 | Determinism | byte-identical every run | non-deterministic graphs |
 
-<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). Search latency is the in-process query cost, excluding the fixed ~58 ms interpreter+import that every CLI invocation pays. The test suite is 166 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
+<sub>Measured on a Korean/English vault (M-series Mac); full methodology and the pre-registered blind benchmark are in the [changelog](CHANGELOG.md). Search latency is the in-process query cost, excluding the fixed ~58 ms interpreter+import that every CLI invocation pays. The test suite is 167 tests, stdlib only, on macOS/Linux/Windows and Python 3.8–3.13.</sub>
 
 **Fan-out for the hard queries.** Pass the question *plus* a rewrite or two in one call and the rankings fuse, so a document several phrasings agree on rises to the top:
 

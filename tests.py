@@ -519,22 +519,38 @@ class TestHaystackCache(VaultTest):
         self.assertIn("no results", run(self.root, "search", "oldtokenzzz"))
 
 
-class TestFtsAtScale(VaultTest):
-    def test_fts_kicks_in_and_stays_in_sync(self):
+class TestPrefilterAtScale(VaultTest):
+    def test_prefilter_kicks_in_and_stays_in_sync(self):
         for i in range(520):
             write(self.root, f"bulk/doc-{i:03d}.md",
                   f"# bulk doc {i}\n\nfiller text alpha beta gamma row {i}\n")
         write(self.root, "bulk/needle.md", "# needle\n\nzxqneedletoken lives here\n")
         run(self.root, "update")
-        db = sqlite3.connect(self.root / ".wikimap" / "index.db")
-        n = db.execute("SELECT COUNT(*) FROM sections_fts").fetchone()[0]
-        db.close()
-        self.assertGreater(n, 0, "FTS should be populated at >=500 docs")
         self.assertIn("bulk/needle.md", run(self.root, "search", "zxqneedletoken"))
         self.assertIn("auth-spec.md", run(self.root, "search", "인증"))
         (self.root / "bulk/needle.md").unlink()
         run(self.root, "update")
         self.assertIn("no results", run(self.root, "search", "zxqneedletoken"))
+
+    def test_legacy_fts_table_is_dropped_and_space_reclaimed(self):
+        for i in range(60):
+            write(self.root, f"bulk/doc-{i:03d}.md", f"# bulk {i}\n\n" + "filler words " * 400)
+        run(self.root, "update")
+        path = self.root / ".wikimap" / "index.db"
+        db = sqlite3.connect(path)
+        db.execute("CREATE VIRTUAL TABLE sections_fts USING fts5(path UNINDEXED, line UNINDEXED, "
+                   "heading, content)")
+        db.execute("INSERT INTO sections_fts SELECT path, line, heading, content FROM sections")
+        db.commit()
+        db.close()
+        before = path.stat().st_size
+        run(self.root, "update")
+        db = sqlite3.connect(path)
+        self.assertIsNone(db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='sections_fts'").fetchone())
+        db.close()
+        self.assertLess(path.stat().st_size, before)
+        self.assertIn("bulk/doc-", run(self.root, "search", "filler"))
 
 
 class TestRecallGate(VaultTest):

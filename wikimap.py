@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # bump when parse_file output changes shape/semantics — forces a full reparse of
 # cached index.db files that would otherwise silently miss the new fields
@@ -62,7 +62,7 @@ All commands: `__WIKIMAP__ [--root <vault>] <cmd>` (or just `wikimap <cmd>` when
 | Command | Purpose |
 |---------|---------|
 | `update [--ignore <dir\|glob>] [--map-path <rel> \| --no-map]` | incremental re-index + regenerate the map (sha-diff, changed files only; prints coverage: indexed vs skipped; map ends with a Health section — orphans, broken links, links to unindexed files, stale semantics). Persistent excludes: `.wikimapignore` at vault root, one dir/glob per line. `--map-path`/`--no-map` persist — use when another tool also indexes the vault root |
-| `search "query" ["variant" ...] [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted; FTS5-accelerated when available); shows the best-matching lines from the *whole* document (≤5, so the answer line surfaces even when it lives outside the top-scoring section); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard). **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — a doc multiple phrasings agree on wins |
+| `search "query" ["variant" ...] [-n 8] [-C 3 \| --full]` | ranked section search (filename/title/heading boosted); shows the best-matching lines from the *whole* document (≤5, so the answer line surfaces even when it lives outside the top-scoring section); `-C N` adds N context lines, `--full` prints the whole section; fresh notes surface first; CJK substring-safe. Query syntax: `"exact phrase"`, `title:x` `path:x` `heading:x` `tag:x` field filters (frontmatter `tags: [a, b]` are indexed), `type:md\|html\|pdf\|image\|text` file-type filter. Frontmatter `aliases:` match at title weight — give a doc a same-language alias to make it findable across languages. When no section matches every term, results relax to a majority-of-terms OR and are marked `partial k/n` (field filters stay hard). **Several phrasings of one question in one call are rank-fused (RRF)** into a single document ranking — a doc multiple phrasings agree on wins |
 | `links <REQ-ID|filename|path>` | docs mentioning a requirement ID, or a doc's outlinks/backlinks/inferred connections — entries tagged `[linked|…]` (written by a human) vs `[inferred|…]` (confirmed guess) |
 | `path <a> <b>` | shortest connection path between two docs (BFS over wiki/md links + fresh edges, both directions) |
 | `note add --question "..." --insight "..." --sources a.md,b.md` | save an answer-time insight (source shas pinned) |
@@ -227,56 +227,19 @@ def open_db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS haystacks(path TEXT PRIMARY KEY, hay TEXT);
         """
     )
-    try:
-        db.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5("
-            "path UNINDEXED, line UNINDEXED, heading, content, tokenize='trigram')"
-        )
-    except sqlite3.OperationalError:
-        pass  # sqlite < 3.34 has no trigram tokenizer — search falls back to linear scan
     return db
 
 
-FTS_MIN_DOCS = 500  # below this a linear scan is already sub-100ms — skip FTS upkeep
+PREFILTER_MIN_DOCS = 500  # below this search scans every section, as it always has
 
 
-def has_fts(db):
-    return bool(
-        db.execute("SELECT 1 FROM sqlite_master WHERE name='sections_fts'").fetchone()
-    )
-
-
-def fts_populated(db):
-    return bool(db.execute("SELECT 1 FROM sections_fts LIMIT 1").fetchone())
-
-
-def sync_fts(db, changed_rels, deleted_rels):
-    if not has_fts(db):
-        return
-    total = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    if total < FTS_MIN_DOCS:
-        if fts_populated(db):
-            db.execute("DELETE FROM sections_fts")
-        return
-    if not fts_populated(db):
-        db.execute(
-            "INSERT INTO sections_fts(path, line, heading, content) "
-            "SELECT path, line, heading, content FROM sections"
-        )
-        return
-    stale = sorted(set(changed_rels) | set(deleted_rels))
-    for i in range(0, len(stale), 500):
-        chunk = stale[i : i + 500]
-        db.execute(
-            "DELETE FROM sections_fts WHERE path IN (%s)" % ",".join("?" * len(chunk)),
-            chunk,
-        )
-    for rel in changed_rels:
-        db.execute(
-            "INSERT INTO sections_fts(path, line, heading, content) "
-            "SELECT path, line, heading, content FROM sections WHERE path=?",
-            (rel,),
-        )
+def drop_legacy_fts(db):
+    """Older indexes carried a trigram FTS5 table that was 3x the corpus on disk
+    and slower than scanning the in-memory haystacks search loads anyway."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='sections_fts'").fetchone():
+        return False
+    db.execute("DROP TABLE sections_fts")
+    return True
 
 
 def parse_frontmatter(lines):
@@ -1706,8 +1669,6 @@ def cmd_update(root, db, args):
         # cached rows predate the current parser — they'd silently miss new fields
         for t in ("files", "sections", "links", "tags", "aliases", "img_alts", "haystacks"):
             db.execute(f"DELETE FROM {t}")
-        if has_fts(db):
-            db.execute("DELETE FROM sections_fts")
         db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('parser_version', ?)",
                    (PARSER_VERSION,))
     known = {p: (sha, mt) for p, sha, mt in db.execute("SELECT path, sha, mtime FROM files")}
@@ -1754,13 +1715,15 @@ def cmd_update(root, db, args):
                (json.dumps(sorted(pdf_no)),))
     img_changed = rebuild_image_sections(db)
     hay_changed = changed_rels + [p for p in img_changed if p not in deleted]
-    sync_fts(db, hay_changed, deleted)
+    dropped_fts = drop_legacy_fts(db)
     sync_haystacks(db, hay_changed, deleted)
     db.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('skipped', ?)",
         (json.dumps(dict(skipped.most_common())),),
     )
     db.commit()
+    if dropped_fts:
+        db.execute("VACUUM")  # DROP TABLE only frees pages; the file keeps its size without this
 
     fresh = stale = 0
     for (src,) in db.execute("SELECT sources FROM notes"):
@@ -2039,34 +2002,21 @@ def write_map(root, db):
     target.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
-def candidate_paths(db, terms, titles, doc_aliases):
-    """FTS5 pre-filter: docs that can possibly satisfy every term.
+def candidate_paths(terms, hays, doc_aliases):
+    """Pre-filter: docs whose title, path, headings or body contain every term.
 
-    Returns None to request a full linear scan (no FTS, or a term shorter
-    than the trigram minimum — pitfall: trigram cannot match <3 chars).
+    Returns None to request a full linear scan (a small corpus, or a term shorter
+    than 3 chars) — the same cases the old trigram FTS fell back on, so rankings
+    don't shift. A term with no space can't straddle the haystack's joins.
     """
-    if not has_fts(db) or not fts_populated(db):
+    if len(hays) < PREFILTER_MIN_DOCS:
         return None
     paths = None
     for t in terms:
         if len(t) < 3:
             return None
-        cur = {
-            p for p in titles
-            if t in p.lower() or t in (titles[p] or "").lower()
-            or any(t in a for a in doc_aliases.get(p, ()))
-        }
-        match = '"%s"' % t.replace('"', '""')
-        try:
-            cur |= {
-                r[0]
-                for r in db.execute(
-                    "SELECT DISTINCT path FROM sections_fts WHERE sections_fts MATCH ?",
-                    (match,),
-                )
-            }
-        except sqlite3.OperationalError:
-            return None
+        cur = {p for p, h in hays.items() if t in h}
+        cur |= {p for p, al in doc_aliases.items() if any(t in a for a in al)}
         paths = cur if paths is None else (paths & cur)
         if not paths:
             return paths
@@ -2157,6 +2107,20 @@ def cmd_search(root, db, args):
             full_scan.append(
                 db.execute("SELECT path, line, heading, content FROM sections").fetchall())
         return full_scan[0]
+
+    def sections_of(paths):
+        # rowid order = all_sections() order; near-tie rankings keep row order
+        rows = []
+        plist = sorted(paths)
+        for i in range(0, len(plist), 500):
+            chunk = plist[i : i + 500]
+            rows += db.execute(
+                "SELECT rowid, path, line, heading, content FROM sections WHERE path IN (%s)"
+                % ",".join("?" * len(chunk)),
+                chunk,
+            ).fetchall()
+        rows.sort(key=lambda r: r[0])
+        return [r[1:] for r in rows]
 
     hay_cache = []
 
@@ -2301,13 +2265,22 @@ def cmd_search(root, db, args):
         # term is impossible, so long queries skip the AND pre-filter and go
         # straight to an idf-gated OR over a full scan. Short queries keep strict AND.
         long_query = len(plain) >= LONG_QUERY
-        fts_terms = [] if long_query else [t for f, t in terms if f in (None, "heading")]
-        paths = candidate_paths(db, fts_terms, titles, doc_aliases) if fts_terms else None
+        prefilter_terms = [] if long_query else [t for f, t in terms if f in (None, "heading")]
+        paths = candidate_paths(prefilter_terms, doc_hays(), doc_aliases) if prefilter_terms else None
+        # collect() drops every doc whose plain-term hits aren't in doc_hits, so
+        # sections of other docs can never surface — skip reading them at all
+        any_hit = set(doc_hits) if plain else None
+        all_hit = {p for p, h in doc_hits.items() if len(h) == len(plain)} if plain else None
         if paths is None:
-            rows = all_sections()
+            if plain:
+                rows = sections_of(any_hit if long_query else all_hit)
+            else:
+                rows = all_sections()
         elif not paths:
             rows = []
         else:
+            if plain:
+                paths &= any_hit if long_query else all_hit
             rows = []
             plist = sorted(paths)
             for i in range(0, len(plist), 500):
@@ -2322,7 +2295,7 @@ def cmd_search(root, db, args):
         partial = long_query
         if not results and not long_query and len(plain) >= 2:
             # every-term AND came up empty — relax plain terms to an idf-gated OR
-            results = collect(all_sections(), False, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs)
+            results = collect(sections_of(any_hit), False, terms, plain, idf, total_idf, long_query, pvariants, doc_hits, hitvs)
             partial = True
         results.sort(key=lambda r: (-r[2], -r[1], -r[0]))
         # weak is the fan-out trigger, so it must not saturate: long queries always

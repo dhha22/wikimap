@@ -42,7 +42,7 @@ wikimap은 순서를 뒤집습니다: **구조는 지금 파싱하고, 의미는
 | 스니펫에 정답 줄 표시 | 예 (섹션 + 라인) | 아니오 (엔티티 라벨만) |
 | 결정성 | 실행마다 바이트 동일 | 비결정적 그래프 |
 
-<sub>한/영 vault(M 시리즈 Mac) 실측입니다. 전체 방법론과 사전 등록 블라인드 벤치마크는 [changelog](CHANGELOG.md)에 있습니다. 검색 지연은 in-process 질의 비용이며, CLI 호출마다 드는 고정 비용(인터프리터+import 약 58ms)은 제외한 값입니다. 테스트 166건(stdlib만), macOS·Linux·Windows / Python 3.8~3.13.</sub>
+<sub>한/영 vault(M 시리즈 Mac) 실측입니다. 전체 방법론과 사전 등록 블라인드 벤치마크는 [changelog](CHANGELOG.md)에 있습니다. 검색 지연은 in-process 질의 비용이며, CLI 호출마다 드는 고정 비용(인터프리터+import 약 58ms)은 제외한 값입니다. 테스트 167건(stdlib만), macOS·Linux·Windows / Python 3.8~3.13.</sub>
 
 **어려운 질의는 fan-out.** 질문에 다른 표현 1~2개를 얹어 한 번에 넘기면 랭킹이 합쳐져, 여러 표현이 공통으로 지목한 문서가 위로 올라옵니다:
 

@@ -6,7 +6,7 @@ English | [한국어](README.ko.md)
 
 **Zero-LLM incremental index + lazy semantic layer for knowledge vaults — markdown, HTML, PDF, and images.**
 
-One Python file. Zero dependencies. Zero LLM cost at build time — always. Sub-second updates, no matter how stale your index is.
+One Python file. Zero dependencies. Zero LLM cost at build time — always. Updates re-read only the files that changed, so they finish in a fraction of a second.
 
 Built for AI coding assistants (Claude Code and friends) working against a knowledge vault: an Obsidian vault, a team wiki, a folder of specs, slides, and plans.
 
@@ -27,7 +27,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 ## Why wikimap
 
-- **Instant, free indexing.** Full build and incremental updates finish in well under a second, with **zero LLM tokens** — graphify needs minutes and millions of tokens for the same vault.
+- **Fast, free indexing.** A full build of a 1,074-document vault takes about 2 seconds, and an update after edits takes a fraction of a second, with **zero LLM tokens** — graphify needs minutes and millions of tokens for the same vault.
 - **More accurate search, not less.** On 135 blind questions (written by agents that only read the corpus, verified before any query ran), wikimap beats a freshly-built graphify graph on recall and puts the answer line right in the snippet.
 - **Fast search, and it stays that way.** A query takes ~60 ms (median) on a 1,074-document vault. 1.5.0 halved that from 1.4.0 and cut the index to a third of its size, with **byte-identical results** across 274 comparisons; 1.3.0 had already made search ~1.5× faster than 1.2.0.
 - **Deterministic and self-cleaning.** Same input → byte-identical index; deleted files disappear on their own. No ghost nodes, no reshuffled results between runs.
@@ -35,7 +35,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 | | wikimap | graphify |
 |---|---|---|
-| Full index build | **sub-second, $0** | minutes + LLM cost |
+| Full index build (1,074 docs) | **~2 s, $0** | minutes + LLM cost |
 | Update after edits | **~0.07 s, 0 tokens** | ~95 s + tens of thousands of tokens |
 | Search accuracy (recall@5, 135 blind Qs) | **0.83** | 0.57 |
 | Search latency (1,074-doc vault, median) | **~60 ms/query** | — |

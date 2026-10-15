@@ -29,7 +29,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 
 - **Instant, free indexing.** Full build and incremental updates finish in well under a second, with **zero LLM tokens** — graphify needs minutes and millions of tokens for the same vault.
 - **More accurate search, not less.** On 135 blind questions (written by agents that only read the corpus, verified before any query ran), wikimap beats a freshly-built graphify graph on recall and puts the answer line right in the snippet.
-- **Fast search, and it stays that way.** Queries run in tens of milliseconds on a 636-document vault — 1.3.0 made search ~1.5× faster than 1.2.0 with **byte-identical rankings**, verified across 600 comparisons.
+- **Fast search, and it stays that way.** A query takes ~60 ms (median) on a 1,074-document vault. 1.5.0 halved that from 1.4.0 and cut the index to a third of its size, with **byte-identical results** across 274 comparisons; 1.3.0 had already made search ~1.5× faster than 1.2.0.
 - **Deterministic and self-cleaning.** Same input → byte-identical index; deleted files disappear on their own. No ghost nodes, no reshuffled results between runs.
 - **Any language, any format.** No hardcoded stopword list, so Korean/English/mixed all work; indexes Markdown plus `.txt/.rst/.org/.adoc`, HTML, PDF, and image filenames.
 
@@ -38,7 +38,7 @@ So the LLM cost tracks **what you actually asked**, not how big your vault is.
 | Full index build | **sub-second, $0** | minutes + LLM cost |
 | Update after edits | **~0.07 s, 0 tokens** | ~95 s + tens of thousands of tokens |
 | Search accuracy (recall@5, 135 blind Qs) | **0.83** | 0.57 |
-| Search latency (636-doc vault) | **~70 ms/query** | — |
+| Search latency (1,074-doc vault, median) | **~60 ms/query** | — |
 | Snippet shows the answer line | yes (section + line) | no (entity labels only) |
 | Determinism | byte-identical every run | non-deterministic graphs |
 
@@ -136,6 +136,7 @@ Everything else, grouped by what it's for:
 Anything cached — a note, an edge, an embedding — is **pinned to the source file's content hash**. Edit that file and the cached knowledge goes stale and drops out on its own, instead of feeding your agent a stale fact.
 
 Every query command takes `--json`. Run `wikimap <command> --help` for the full flags: phrase/field/type filters, context lines, ignore rules, and the rest.
+
 ### Coming from graphify?
 
 ```bash
@@ -165,7 +166,7 @@ We tested this the hard way: took a 348-doc vault, **stripped all 949 of its hum
 
 - `MAP.md` — vault root. Directory taxonomy, hub documents, recent changes, cross-document requirement IDs, inferred connections, fresh notes. The agent entry point.
 - `.wikimap/semantics.jsonl` — the notes and edges themselves, append-only JSON lines. **This file is the source of truth** for the semantic layer: commit it to git to back up and share what your assistant has learned about the vault. Hand-editable; one bad line never takes the layer down.
-- `.wikimap/index.db` — SQLite. A derived cache, genuinely disposable: delete it anytime, `update` rebuilds it from your files plus `semantics.jsonl` with nothing lost.
+- `.wikimap/index.db` — SQLite. A derived cache, genuinely disposable: delete it anytime, `update` rebuilds it from your files plus `semantics.jsonl` with nothing lost. It stays small: ~30 MB for a 1,074-document vault.
 
 Upgrading from ≤0.5.x: the first run migrates existing DB notes/edges into `semantics.jsonl` automatically, one-time, nothing to do.
 
